@@ -239,6 +239,10 @@ cc_library(
     name = "llm_litert_compiled_model_executor",
     srcs = ["llm_litert_compiled_model_executor.cc"],
     hdrs = ["llm_litert_compiled_model_executor.h"],
+    local_defines = select({
+        "//build_config:async_constraint_masking": ["LITERT_LM_ASYNC_CONSTRAINT_MASKING"],
+        "//conditions:default": [],
+    }),
     deps = [
         ":common_utils",
         ":executor_settings_base",
@@ -294,6 +298,11 @@ cc_library(
             "@litert//litert/cc/options:litert_gpu_options",
             "@litert//litert/cc/options:litert_runtime_options",
         ],
+    }) + select({
+        "//build_config:async_constraint_masking": [
+            "//runtime/framework:threadpool",
+        ],
+        "//conditions:default": [],
     }),
 )
 

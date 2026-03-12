@@ -88,6 +88,15 @@ class LlmExecutorBase {
                      ExecutorBackendName()));
   };
 
+  // Samples token(s) from logits using the executor's internal sampler.
+  // Logits may be GPU-resident; sampling happens on the same device.
+  // Returns token IDs tensor buffer of shape [output_heads].
+  virtual absl::StatusOr<::litert::TensorBuffer> SampleToken(
+      const ::litert::TensorBuffer& logits) {
+    return absl::UnimplementedError(absl::StrCat(
+        "SampleToken not implemented for backend: ", ExecutorBackendName()));
+  }
+
   virtual absl::string_view ExecutorBackendName() const = 0;
 
   // Get vocabulary size used to build tensor buffers for decode functions.

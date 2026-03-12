@@ -393,6 +393,10 @@ cc_library(
     name = "tasks",
     srcs = ["tasks.cc"],
     hdrs = ["tasks.h"],
+    local_defines = select({
+        "//build_config:async_constraint_masking": ["LITERT_LM_ASYNC_CONSTRAINT_MASKING"],
+        "//conditions:default": [],
+    }),
     deps = [
         "@com_google_absl//absl/base:nullability",
         "@com_google_absl//absl/functional:any_invocable",
@@ -424,6 +428,11 @@ cc_library(
             "@litert//litert/cc:litert_macros",
             "@litert//litert/cc:litert_tensor_buffer",
         ],
+    }) + select({
+        "//build_config:async_constraint_masking": [
+            "//runtime/framework:threadpool",
+        ],
+        "//conditions:default": [],
     }),
 )
 

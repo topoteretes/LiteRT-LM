@@ -148,9 +148,13 @@ class LitertLmLoader {
 
   // Returns the tokenizer section buffer.
   litert::BufferRef<uint8_t> GetLlmMetadata() {
-    return GetSectionBuffer(
-               BufferKey(schema::AnySectionDataType_LlmMetadataProto))
-        .value();
+    auto optional_section_buffer =
+        GetSectionBuffer(BufferKey(schema::AnySectionDataType_LlmMetadataProto));
+    if (optional_section_buffer.has_value()) {
+      return optional_section_buffer.value();
+    }
+    ABSL_LOG(WARNING) << "LlmMetadata not found. Skipping.";
+    return litert::BufferRef<uint8_t>();
   }
 
   absl::StatusOr<std::pair<size_t, size_t>> GetSectionLocation(

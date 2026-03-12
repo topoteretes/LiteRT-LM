@@ -135,4 +135,139 @@ absl::Status ConstrainedDecoder::MaskLogits(
   return absl::OkStatus();
 }
 
+#ifdef LITERT_LM_ASYNC_CONSTRAINT_MASKING
+
+absl::Status ConstrainedDecoder::StartPrecomputeMask(ThreadPool& thread_pool) {
+  {
+    absl::MutexLock lock(&mask_mutex_);
+    mask_ready_ = false;
+    mask_status_ = absl::OkStatus();
+    precomputed_bitmaps_.clear();
+    precomputed_bitmaps_.resize(batch_size_);
+  }
+
+  // Capture raw pointers to constraint states — they won't change until
+  // ApplyPrecomputedMask is called (which waits for this to complete).
+  return thread_pool.Schedule(
+      [this]() {
+        absl::Status status = absl::OkStatus();
+        std::vector<std::unique_ptr<Bitmap>> bitmaps(batch_size_);
+        for (int b = 0; b < batch_size_; ++b) {
+          auto bitmap_or = constraint_->ComputeBitmap(*constraint_states_[b]);
+          if (!bitmap_or.ok()) {
+            status = bitmap_or.status();
+            break;
+          }
+          bitmaps[b] = std::move(*bitmap_or);
+        }
+        absl::MutexLock lock(&mask_mutex_);
+        precomputed_bitmaps_ = std::move(bitmaps);
+        mask_status_ = status;
+        mask_ready_ = true;
+      });
+}
+
+absl::Status ConstrainedDecoder::ApplyPrecomputedMask(
+    ::litert::TensorBuffer& logits) {
+  LITERT_ASSIGN_OR_RETURN(auto logits_tensor_type, logits.TensorType());
+  LITERT_ASSIGN_OR_RETURN(auto logits_span, ReferTensorBufferAsSpan<float>(logits));
+  return ApplyPrecomputedMask(logits_span,
+                              logits_tensor_type.Layout().Dimensions());
+}
+
+absl::Status ConstrainedDecoder::ApplyPrecomputedMask(
+    absl::Span<float> logits,
+    absl::Span<const ::litert::Layout::Dim> logits_dims) {
+  RET_CHECK_EQ(logits_dims.size(), 3)
+      << "Only support logits with dimensions [batch_size, 1, vocab_size].";
+  int batch_size = logits_dims[0];
+  int sequence_length = logits_dims[1];
+  int vocab_size = logits_dims[2];
+  RET_CHECK_EQ(sequence_length, 1) << "Only support sequence length 1.";
+  RET_CHECK_LE(vocab_size, constraint_->GetVocabularySize())
+      << "Vocabulary size [" << vocab_size
+      << "] does not match the expected vocabulary size ["
+      << constraint_->GetVocabularySize() << "].";
+  RET_CHECK_EQ(batch_size, batch_size_)
+      << "Batch size [" << batch_size
+      << "] does not match the expected batch size [" << batch_size_ << "].";
+
+  // Wait for the precomputed bitmaps to be ready.
+  {
+    absl::MutexLock lock(&mask_mutex_);
+    mask_mutex_.Await(absl::Condition(&mask_ready_));
+    RETURN_IF_ERROR(mask_status_);
+  }
+
+  // Apply the precomputed bitmaps to the logits.
+  for (int b = 0; b < batch_size; ++b) {
+    const auto& bitmap = precomputed_bitmaps_[b];
+    for (int i = 0; i < vocab_size; ++i) {
+      if (!bitmap->Get(i)) {
+        logits.data()[b * vocab_size + i] =
+            std::numeric_limits<float>::lowest();
+      }
+    }
+  }
+
+  // Reset for next step.
+  {
+    absl::MutexLock lock(&mask_mutex_);
+    mask_ready_ = false;
+    precomputed_bitmaps_.clear();
+  }
+
+  return absl::OkStatus();
+}
+
+absl::StatusOr<bool> ConstrainedDecoder::ValidateSpeculativeTokens(
+    absl::Span<const int> token_ids) {
+  RET_CHECK_EQ(static_cast<int>(token_ids.size()), batch_size_)
+      << "Token IDs size [" << token_ids.size()
+      << "] does not match batch size [" << batch_size_ << "].";
+
+  // Wait for the precomputed bitmaps to be ready.
+  {
+    absl::MutexLock lock(&mask_mutex_);
+    mask_mutex_.Await(absl::Condition(&mask_ready_));
+    RETURN_IF_ERROR(mask_status_);
+  }
+
+  // Check each token against its bitmap.
+  for (int b = 0; b < batch_size_; ++b) {
+    if (!precomputed_bitmaps_[b]->Get(token_ids[b])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+absl::Status ConstrainedDecoder::AcceptSpeculativeTokens(
+    absl::Span<const int> token_ids) {
+  RET_CHECK_EQ(static_cast<int>(token_ids.size()), batch_size_)
+      << "Token IDs size [" << token_ids.size()
+      << "] does not match batch size [" << batch_size_ << "].";
+
+  // Advance constraint state for each batch element.
+  for (int i = 0; i < batch_size_; ++i) {
+    auto& constraint_state = constraint_states_[i];
+    ASSIGN_OR_RETURN(
+        constraint_state,
+        constraint_->ComputeNext(*constraint_state, token_ids[i]));
+    if (constraint_->IsEnded(*constraint_state)) {
+      constraint_state = constraint_->Start();
+    }
+  }
+
+  // Clear precomputed bitmaps.
+  {
+    absl::MutexLock lock(&mask_mutex_);
+    mask_ready_ = false;
+    precomputed_bitmaps_.clear();
+  }
+  return absl::OkStatus();
+}
+
+#endif  // LITERT_LM_ASYNC_CONSTRAINT_MASKING
+
 }  // namespace litert::lm

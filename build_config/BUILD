@@ -59,3 +59,8 @@ config_setting(
     name = "ios_sim_arm64",
     values = { "apple_platform_type": "ios", "cpu": "ios_sim_arm64",},
 )
+
+config_setting(
+    name = "async_constraint_masking",
+    define_values = {"async_constraint_masking": "true"},
+)

@@ -135,6 +135,9 @@ absl::StatusOr<const proto::LlmMetadata*>
 ModelResourcesLitertLm::GetLlmMetadata() {
   if (llm_metadata_ == nullptr) {
     auto buffer_ref = litert_lm_loader_->GetLlmMetadata();
+    if (buffer_ref.Size() == 0) {
+      return absl::NotFoundError("LlmMetadata not found in the model.");
+    }
     auto llm_metadata = std::make_unique<proto::LlmMetadata>();
     if (!llm_metadata->ParseFromString(
             std::string(buffer_ref.StrView()))) {  // NOLINT

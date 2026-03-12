@@ -66,8 +66,8 @@ using ::litert::CompiledModel;
 using ::litert::Environment;
 using ::litert::TensorBuffer;
 
-constexpr char kPrefillSignature[] = "prefill_128";
-constexpr int kPrefillSize = 128;
+constexpr absl::string_view kPrefillSignaturePrefix = "prefill";
+constexpr absl::string_view kInputPosTensorName = "input_pos";
 constexpr char kDecodeSignature[] = "decode";
 constexpr char cache_k25[] = "kv_cache_k_25";
 constexpr char cache_v25[] = "kv_cache_v_25";
@@ -220,15 +220,60 @@ absl::StatusOr<int> ApplyGreedySampling(const TensorBuffer& decoded_logits) {
   }
 }
 
+absl::StatusOr<int> ApplyConstrainedGreedySampling(
+    const TensorBuffer& decoded_logits,
+    ConstrainedDecoder* constraint_decoder) {
+  RET_CHECK_NE(constraint_decoder, nullptr)
+      << "Constraint decoder must be set for constrained sampling.";
+
+  LITERT_ASSIGN_OR_RETURN(RankedTensorType logits_tensor_type,
+                          decoded_logits.TensorType());
+
+  std::vector<float> logits_buffer_float;
+  if (logits_tensor_type.ElementType() == ::litert::ElementType::Float32) {
+    LITERT_ASSIGN_OR_RETURN(logits_buffer_float,
+                            CopyFromTensorBuffer<float>(decoded_logits));
+  } else if (logits_tensor_type.ElementType() ==
+             ::litert::ElementType::Int16) {
+    LITERT_ASSIGN_OR_RETURN(auto logits_buffer_int16,
+                            CopyFromTensorBuffer<int16_t>(decoded_logits));
+    logits_buffer_float.reserve(logits_buffer_int16.size());
+    for (int16_t value : logits_buffer_int16) {
+      logits_buffer_float.push_back(static_cast<float>(value));
+    }
+  } else {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Unsupported logits element type for constrained sampling: ",
+        logits_tensor_type.ElementType()));
+  }
+
+  RETURN_IF_ERROR(constraint_decoder->MaskLogits(
+      absl::MakeSpan(logits_buffer_float),
+      logits_tensor_type.Layout().Dimensions()));
+
+  int max_index = 0;
+  float max_value = std::numeric_limits<float>::lowest();
+  for (int i = 0; i < static_cast<int>(logits_buffer_float.size()); ++i) {
+    if (logits_buffer_float[i] > max_value) {
+      max_value = logits_buffer_float[i];
+      max_index = i;
+    }
+  }
+  return max_index;
+}
+
 // Returns true if the transformer model has a per layer embedder input buffer.
 litert::Expected<bool> HasPerLayerEmbedder(
     const litert::Model& transformer_model) {
-  LITERT_ASSIGN_OR_RETURN(
-      auto input_names,
-      transformer_model.GetSignatureInputNames(kPrefillSignature));
-  for (auto input_name : input_names) {
-    if (kPerLayerEmbedderTensor == input_name) {
-      return true;
+  LITERT_ASSIGN_OR_RETURN(auto signatures, transformer_model.GetSignatures());
+  for (const auto& signature : signatures) {
+    if (!absl::StartsWith(signature.Key(), kPrefillSignaturePrefix)) {
+      continue;
+    }
+    for (auto input_name : signature.InputNames()) {
+      if (kPerLayerEmbedderTensor == input_name) {
+        return true;
+      }
     }
   }
   return false;
@@ -620,6 +665,7 @@ LlmLiteRtNpuCompiledModelExecutor::CreateRopeContextWithBufferSharing(
 absl::Status LlmLiteRtNpuCompiledModelExecutor::AllocateTransformerBuffers(
     litert::Environment& env, const litert::Model* transformer_model,
     CompiledModel& llm_compiled_model,
+    absl::string_view prefill_signature,
     absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&
         gemma_prefill_input_buffers,
     absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&
@@ -630,23 +676,23 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::AllocateTransformerBuffers(
         prefill_output_kv_cache_slice_buffers,
     absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&
         decode_output_kv_cache_slice_buffers) {
-  auto prefill_signature = transformer_model->FindSignature(kPrefillSignature);
+  auto prefill_signature_def = transformer_model->FindSignature(prefill_signature);
 
   constexpr absl::string_view kv_cache_slice_k_root_name = "kv_slice_k_";
   constexpr absl::string_view kv_cache_slice_v_root_name = "kv_slice_v_";
 
   // Create input buffers for prefill signature.
-  for (auto input_name : prefill_signature->InputNames()) {
+  for (auto input_name : prefill_signature_def->InputNames()) {
     if (absl::StartsWith(input_name, kv_cache_k_root_name) ||
         absl::StartsWith(input_name, kv_cache_v_root_name)) {
       LITERT_ASSIGN_OR_RETURN(
           input_kv_cache_buffers[input_name],
-          llm_compiled_model.CreateInputBuffer(kPrefillSignature, input_name));
+          llm_compiled_model.CreateInputBuffer(prefill_signature, input_name));
       input_kv_cache_buffers[input_name].Clear();
     } else {
       LITERT_ASSIGN_OR_RETURN(
           gemma_prefill_input_buffers[input_name],
-          llm_compiled_model.CreateInputBuffer(kPrefillSignature, input_name));
+          llm_compiled_model.CreateInputBuffer(prefill_signature, input_name));
       gemma_prefill_input_buffers[input_name].Clear();
     }
   }
@@ -673,12 +719,12 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::AllocateTransformerBuffers(
   }
 
   // Create output buffers for prefill signature.
-  for (auto output_name : prefill_signature->OutputNames()) {
+  for (auto output_name : prefill_signature_def->OutputNames()) {
     if (absl::StartsWith(output_name, kv_cache_slice_k_root_name) ||
         absl::StartsWith(output_name, kv_cache_slice_v_root_name)) {
       LITERT_ASSIGN_OR_RETURN(
           prefill_output_kv_cache_slice_buffers[output_name],
-          llm_compiled_model.CreateOutputBuffer(kPrefillSignature,
+          llm_compiled_model.CreateOutputBuffer(prefill_signature,
                                                 output_name));
     }
   }
@@ -698,6 +744,7 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::AllocateTransformerBuffers(
 absl::StatusOr<LlmLiteRtNpuCompiledModelExecutor::InferenceContext>
 LlmLiteRtNpuCompiledModelExecutor::CreateLlmInferenceContextWithBufferSharing(
     ::litert::Environment& env, ::litert::CompiledModel& llm_compiled_model,
+    absl::string_view prefill_signature,
     absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&
         input_kv_cache_buffers,
     absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&
@@ -717,7 +764,7 @@ LlmLiteRtNpuCompiledModelExecutor::CreateLlmInferenceContextWithBufferSharing(
     // Duplicate all kv cache buffers to prefill inputs.
     LITERT_ASSIGN_OR_RETURN(
         auto prefill_input_names,
-        llm_compiled_model.GetSignatureInputNames(kPrefillSignature));
+        llm_compiled_model.GetSignatureInputNames(prefill_signature));
     for (const auto& [key, value] : input_kv_cache_buffers) {
       // Check if the kv cache buffer is used in the prefill signature.
       if (absl::c_find(prefill_input_names, std::string(key)) ==
@@ -731,14 +778,14 @@ LlmLiteRtNpuCompiledModelExecutor::CreateLlmInferenceContextWithBufferSharing(
       // by creating a new buffer with the correct size.
       LITERT_ASSIGN_OR_RETURN(
           auto input_tensor_type,
-          llm_compiled_model.GetInputTensorType(kPrefillSignature, key));
+          llm_compiled_model.GetInputTensorType(prefill_signature, key));
       LITERT_ASSIGN_OR_RETURN(auto input_tensor_size,
                               input_tensor_type.Bytes());
       LITERT_ASSIGN_OR_RETURN(auto input_buffer_size, value.Size());
       if (input_tensor_size != input_buffer_size) {
         LITERT_ASSIGN_OR_RETURN(
             auto corrected_input_buffer,
-            llm_compiled_model.CreateInputBuffer(kPrefillSignature, key));
+            llm_compiled_model.CreateInputBuffer(prefill_signature, key));
         corrected_input_buffer.Clear();
         LITERT_ASSIGN_OR_RETURN(prefill_input_buffers[key],
                                 corrected_input_buffer.Duplicate());
@@ -846,6 +893,7 @@ LlmLiteRtNpuCompiledModelExecutor::
 
 absl::Status LlmLiteRtNpuCompiledModelExecutor::WarmupInference(
     ::litert::CompiledModel& compiled_model_llm,
+    absl::string_view prefill_signature,
     InferenceContext& llm_inference_context,
     ::litert::CompiledModel& compiled_model_auxiliary,
     const InferenceContext& rope_inference_context,
@@ -873,7 +921,7 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::WarmupInference(
              1));
   }
   auto result = compiled_model_llm.Run(
-      LlmSignatures::kPrefillLlm, llm_inference_context.prefill_input_buffers,
+      prefill_signature, llm_inference_context.prefill_input_buffers,
       llm_inference_context.prefill_output_buffers);
   RET_CHECK(result) << "Inference warmup run for Gemma3 (prefill) failed."
                     << result.Error().Message();
@@ -983,7 +1031,7 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::Prefill(
     RETURN_IF_ERROR(PrefillInternal(prefill_signature,
                                     ids.subspan(/*pos=*/0, prefill_length)));
     ids = ids.subspan(/*pos=*/prefill_length);
-    latency_stats_.prefill_num_tokens += kPrefillSize;
+    latency_stats_.prefill_num_tokens += prefill_length;
   }
   RET_CHECK_EQ(ids.size(), 0).SetCode(absl::StatusCode::kInternal)
       << "Work groups not covering the entire prefill input.";
@@ -1007,10 +1055,6 @@ LlmLiteRtNpuCompiledModelExecutor::Decode() {
 absl::StatusOr<std::vector<std::vector<int>>>
 LlmLiteRtNpuCompiledModelExecutor::Decode(
     const ExecutorDecodeParams& decode_params) {
-  if (decode_params.HasConstraintDecoder()) {
-    return absl::UnimplementedError(
-        "Constrained decoding is not supported on NPU.");
-  }
   auto start = absl::Now();
   ::litert::TensorBuffer& decoded_logits =
       llm_inference_context_
@@ -1027,11 +1071,27 @@ LlmLiteRtNpuCompiledModelExecutor::Decode(
   if (pending_input_token.empty()) {
     return absl::InvalidArgumentError("No id available to be decoded.");
   }
+
+  // Update constraint state with the last decoded token before running decode.
+  if (decode_params.HasConstraintDecoder() &&
+      latency_stats_.decode_num_tokens > 0) {
+    int last_token_id = pending_input_token[0]->id();
+    RETURN_IF_ERROR(decode_params.GetConstraintDecoder()->UpdateConstraintState(
+        absl::MakeSpan(&last_token_id, 1)));
+  }
+
   RETURN_IF_ERROR(DecodeInternal(internal_start_step, pending_input_token[0]));
   RETURN_IF_ERROR(processed_tokens_.MarkPendingInputTokenAsProcessed());
 
   auto start_sample = absl::Now();
-  ASSIGN_OR_RETURN(const int max_index, ApplyGreedySampling(decoded_logits));
+  int max_index = 0;
+  if (decode_params.HasConstraintDecoder()) {
+    ASSIGN_OR_RETURN(max_index,
+                     ApplyConstrainedGreedySampling(
+                         decoded_logits, decode_params.GetConstraintDecoder()));
+  } else {
+    ASSIGN_OR_RETURN(max_index, ApplyGreedySampling(decoded_logits));
+  }
 
   latency_stats_.decode_sampling_latency_us +=
       absl::ToInt64Microseconds(absl::Now() - start_sample);
@@ -1516,10 +1576,18 @@ LlmLiteRtNpuCompiledModelExecutor::CreateForModelHasPerLayerEmbedding(
   absl::flat_hash_map<absl::string_view, TensorBuffer>
       decode_output_kv_cache_slice_buffers;
 
+  ASSIGN_OR_RETURN(auto prefill_runner_set,
+                   GetPrefillRunnerSetFromModel(
+                       *transformer_model, kPrefillSignaturePrefix,
+                       kInputPosTensorName));
+  RET_CHECK(!prefill_runner_set.empty())
+      << "No prefill signatures found in transformer model.";
+  const std::string prefill_signature = prefill_runner_set.begin()->second;
+
   absl::Status allocate_status = AllocateTransformerBuffers(
-      env, transformer_model, llm_compiled_model, gemma_prefill_input_buffers,
-      gemma_decode_input_buffers, input_kv_cache_buffers,
-      prefill_output_kv_cache_slice_buffers,
+      env, transformer_model, llm_compiled_model, prefill_signature,
+      gemma_prefill_input_buffers, gemma_decode_input_buffers,
+      input_kv_cache_buffers, prefill_output_kv_cache_slice_buffers,
       decode_output_kv_cache_slice_buffers);
   if (!allocate_status.ok()) {
     return allocate_status;
@@ -1541,7 +1609,7 @@ LlmLiteRtNpuCompiledModelExecutor::CreateForModelHasPerLayerEmbedding(
   ASSIGN_OR_RETURN(
       auto llm_inference_context,
       CreateLlmInferenceContextWithBufferSharing(
-          env, llm_compiled_model, input_kv_cache_buffers,
+          env, llm_compiled_model, prefill_signature, input_kv_cache_buffers,
           prefill_output_kv_cache_slice_buffers,
           decode_output_kv_cache_slice_buffers, gemma_prefill_input_buffers,
           gemma_decode_input_buffers));
@@ -1590,13 +1658,9 @@ LlmLiteRtNpuCompiledModelExecutor::CreateForModelHasPerLayerEmbedding(
           std::move(decode_input_pos)));
 
   RETURN_IF_ERROR(WarmupInference(
-      llm_compiled_model, llm_inference_context,
+      llm_compiled_model, prefill_signature, llm_inference_context,
       npu_auxiliary_context.npu_auxiliary_compiled_model, rope_context,
       mask_context, cache_update_inference_context));
-
-  // For now we only support one prefill length in the model.
-  SortedPrefillSignatureMap prefill_runner_set;
-  prefill_runner_set[kPrefillSize] = kPrefillSignature;
 
   absl::flat_hash_map<int, const Model*> end_of_multi_modal_embedding_models;
   absl::StatusOr<const litert::Model*> maybe_end_of_audio_model =
@@ -1655,6 +1719,14 @@ LlmLiteRtNpuCompiledModelExecutor::CreateForModelWithoutPerLayerEmbedding(
       CompiledModel llm_compiled_model,
       CompiledModel::Create(env, transformer_model->Get(), options));
 
+  ASSIGN_OR_RETURN(auto prefill_runner_set,
+                   GetPrefillRunnerSetFromModel(
+                       *transformer_model, kPrefillSignaturePrefix,
+                       kInputPosTensorName));
+  RET_CHECK(!prefill_runner_set.empty())
+      << "No prefill signatures found in transformer model.";
+  const std::string prefill_signature = prefill_runner_set.begin()->second;
+
   // Allocate all input and output buffers of the LLM model that are meant to be
   // used by the NPU chip first, so that we can later duplicate the buffers into
   // the output buffer maps of the embedder, mask, and rope signatures.
@@ -1670,7 +1742,8 @@ LlmLiteRtNpuCompiledModelExecutor::CreateForModelWithoutPerLayerEmbedding(
       decode_output_kv_cache_slice_buffers;
 
   absl::Status allocate_status = AllocateTransformerBuffers(
-      env, transformer_model, llm_compiled_model, gemma_prefill_input_buffers,
+      env, transformer_model, llm_compiled_model, prefill_signature,
+      gemma_prefill_input_buffers,
       gemma_decode_input_buffers, input_kv_cache_buffers,
       prefill_output_kv_cache_slice_buffers,
       decode_output_kv_cache_slice_buffers);
@@ -1680,7 +1753,7 @@ LlmLiteRtNpuCompiledModelExecutor::CreateForModelWithoutPerLayerEmbedding(
   ASSIGN_OR_RETURN(
       auto llm_inference_context,
       CreateLlmInferenceContextWithBufferSharing(
-          env, llm_compiled_model, input_kv_cache_buffers,
+          env, llm_compiled_model, prefill_signature, input_kv_cache_buffers,
           prefill_output_kv_cache_slice_buffers,
           decode_output_kv_cache_slice_buffers, gemma_prefill_input_buffers,
           gemma_decode_input_buffers));
@@ -1764,13 +1837,9 @@ LlmLiteRtNpuCompiledModelExecutor::CreateForModelWithoutPerLayerEmbedding(
           std::move(decode_input_pos)));
 
   RETURN_IF_ERROR(WarmupInference(
-      llm_compiled_model, llm_inference_context,
+      llm_compiled_model, prefill_signature, llm_inference_context,
       npu_auxiliary_context.npu_auxiliary_compiled_model, rope_context,
       mask_context, cache_update_inference_context));
-
-  // For now we only support one prefill length in the model.
-  SortedPrefillSignatureMap prefill_runner_set;
-  prefill_runner_set[kPrefillSize] = kPrefillSignature;
 
   std::optional<EmbedderPerLayerContext> embedder_per_layer_context =
       std::nullopt;

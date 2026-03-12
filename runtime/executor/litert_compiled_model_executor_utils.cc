@@ -204,16 +204,32 @@ absl::StatusOr<SortedPrefillSignatureMap> GetPrefillRunnerSetFromModel(
     const ::litert::Model& model, absl::string_view signature_name_base,
     absl::string_view input_positions_name) {
   SortedPrefillSignatureMap prefill_runner_set;
+  constexpr std::array<absl::string_view, 3> kFallbackInputNames = {
+      "embeddings", "tokens", "token_ids"};
   auto signatures = model.GetSignatures();
   for (auto& signature : *signatures) {
     if (auto signature_key = signature.Key();
         absl::StartsWith(signature_key, signature_name_base)) {
-      LITERT_ASSIGN_OR_RETURN(auto input_positions_tensor,
-                              signature.InputTensor(input_positions_name));
+      auto input_sequence_tensor = signature.InputTensor(input_positions_name);
+      if (!input_sequence_tensor) {
+        for (auto fallback_name : kFallbackInputNames) {
+          input_sequence_tensor = signature.InputTensor(fallback_name);
+          if (input_sequence_tensor) {
+            break;
+          }
+        }
+      }
+      if (!input_sequence_tensor) {
+        continue;
+      }
       LITERT_ASSIGN_OR_RETURN(auto ranked_tensor_type,
-                              input_positions_tensor.RankedTensorType());
+                              input_sequence_tensor->RankedTensorType());
       if (ranked_tensor_type.Layout().Rank() == 2) {
         // [batch_size, max_seq_len]
+        prefill_runner_set[ranked_tensor_type.Layout().Dimensions()[1]] =
+            std::string(signature_key);
+      } else if (ranked_tensor_type.Layout().Rank() == 3) {
+        // [batch_size, max_seq_len, hidden_size]
         prefill_runner_set[ranked_tensor_type.Layout().Dimensions()[1]] =
             std::string(signature_key);
       } else if (ranked_tensor_type.Layout().Rank() == 1) {

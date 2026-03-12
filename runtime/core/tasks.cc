@@ -50,6 +50,9 @@
 #include "runtime/proto/sampler_params.pb.h"
 #include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/status_macros.h"  //NOLINT
+#ifdef LITERT_LM_ASYNC_CONSTRAINT_MASKING
+#include "runtime/framework/threadpool.h"
+#endif
 
 namespace litert::lm::Tasks {
 namespace {
@@ -112,6 +115,10 @@ class DecodeOneStep {
     if (constraint != nullptr) {
       constrained_decoder_ = std::make_unique<ConstrainedDecoder>(
           constraint, num_output_candidates_);
+#ifdef LITERT_LM_ASYNC_CONSTRAINT_MASKING
+      mask_thread_pool_ =
+          std::make_unique<ThreadPool>("constraint_mask", /*max_num_threads=*/1);
+#endif
     }
     if (sampler_.has_value()) {  // External sampling setup
       auto scores_tensor = CreateTensorBuffer<float>({num_output_candidates_});
@@ -247,6 +254,80 @@ class DecodeOneStep {
         RETURN_IF_ERROR(
             constrained_decoder_->UpdateConstraintState(last_token_ids));
       }
+
+#ifdef LITERT_LM_ASYNC_CONSTRAINT_MASKING
+      // --- SPECULATIVE CONSTRAINED DECODING ---
+      // Instead of copying 1MB of logits GPU→CPU→GPU for masking, we:
+      // 1. Precompute the constraint bitmap on a background thread
+      // 2. Run the GPU forward pass
+      // 3. Sample a token on GPU (no logits copy)
+      // 4. Check the token against the bitmap
+      // 5. Accept if valid, otherwise fall back to full masking
+      if (constrained_decoder_ && mask_thread_pool_) {
+        // Start async bitmap precomputation.
+        RETURN_IF_ERROR(
+            constrained_decoder_->StartPrecomputeMask(*mask_thread_pool_));
+
+        // GPU forward pass (logits stay on GPU).
+        if (benchmark_info_.has_value()) {
+          RETURN_IF_ERROR(benchmark_info_->TimeMarkDelta("executor_decode"));
+        }
+        ASSIGN_OR_RETURN(auto output_logits, executor_.DecodeLogits(inputs));
+        if (benchmark_info_.has_value()) {
+          RETURN_IF_ERROR(benchmark_info_->TimeMarkDelta("executor_decode"));
+        }
+
+        // Speculatively sample on GPU (no logits copy).
+        auto spec_token_or = executor_.SampleToken(output_logits);
+        if (spec_token_or.ok()) {
+          LITERT_ASSIGN_OR_RETURN(
+              auto spec_ids_span,
+              ReferTensorBufferAsSpan<int>(*spec_token_or));
+
+          // Validate against precomputed bitmap.
+          ASSIGN_OR_RETURN(
+              bool all_valid,
+              constrained_decoder_->ValidateSpeculativeTokens(
+                  absl::MakeConstSpan(spec_ids_span.data(),
+                                      spec_ids_span.size())));
+
+          if (all_valid) {
+            // FAST PATH: accept token, no logits copy needed.
+            RETURN_IF_ERROR(
+                constrained_decoder_->AcceptSpeculativeTokens(
+                    absl::MakeConstSpan(spec_ids_span.data(),
+                                        spec_ids_span.size())));
+            std::vector<int> spec_ids(spec_ids_span.begin(),
+                                      spec_ids_span.end());
+            decoded_ids->Write<int>(spec_ids);
+            std::vector<float> scores(spec_ids.size(), 0.0f);
+            scores_tensor_.Write<float>(scores);
+            ASSIGN_OR_RETURN(auto token_ids,
+                             tokenizer_.TensorBufferToTokenIds(*decoded_ids));
+            return token_ids;
+          }
+        }
+
+        // FALLBACK: speculative token invalid or SampleToken unsupported.
+        // Apply precomputed mask to logits and resample.
+        RETURN_IF_ERROR(
+            constrained_decoder_->ApplyPrecomputedMask(output_logits));
+
+        if (benchmark_info_.has_value()) {
+          RETURN_IF_ERROR(benchmark_info_->TimeMarkDelta("sampling"));
+        }
+        RETURN_IF_ERROR(sampler_.value()->SampleToIdAndScoreBuffer(
+            output_logits, decoded_ids.value(), &scores_tensor_));
+        if (benchmark_info_.has_value()) {
+          RETURN_IF_ERROR(benchmark_info_->TimeMarkDelta("sampling"));
+        }
+        ASSIGN_OR_RETURN(auto token_ids,
+                         tokenizer_.TensorBufferToTokenIds(decoded_ids.value()));
+        return token_ids;
+      }
+#endif  // LITERT_LM_ASYNC_CONSTRAINT_MASKING
+
+      // --- STANDARD PATH (no async masking / no constraint) ---
       // Decoding section.
       if (benchmark_info_.has_value()) {
         RETURN_IF_ERROR(benchmark_info_->TimeMarkDelta("executor_decode"));
@@ -255,13 +336,12 @@ class DecodeOneStep {
       if (benchmark_info_.has_value()) {
         RETURN_IF_ERROR(benchmark_info_->TimeMarkDelta("executor_decode"));
       }
-      // If constrained decoding is enabled, masks the logits based on the
-      // constraint state.
+      // If constrained decoding is enabled, masks the logits.
       if (constrained_decoder_) {
         RETURN_IF_ERROR(constrained_decoder_->MaskLogits(output_logits));
       }
 
-      // Samping section.
+      // Sampling section.
       if (benchmark_info_.has_value()) {
         RETURN_IF_ERROR(benchmark_info_->TimeMarkDelta("sampling"));
       }
@@ -301,6 +381,9 @@ class DecodeOneStep {
   const int num_output_candidates_;
   std::optional<Sampler*> sampler_;
   std::unique_ptr<ConstrainedDecoder> constrained_decoder_;
+#ifdef LITERT_LM_ASYNC_CONSTRAINT_MASKING
+  std::unique_ptr<ThreadPool> mask_thread_pool_;
+#endif
   std::optional<BenchmarkInfo> benchmark_info_;
   StopTokenDetector stop_token_detector_;
 

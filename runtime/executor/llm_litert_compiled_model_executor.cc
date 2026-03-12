@@ -1118,7 +1118,174 @@ LlmLiteRtCompiledModelExecutorBase::Decode() {
 absl::StatusOr<std::vector<std::vector<int>>>
 LlmLiteRtCompiledModelExecutorBase::Decode(
     const ExecutorDecodeParams& decode_params) {
+  bool sampled_speculatively = false;
 
+#ifdef LITERT_LM_ASYNC_CONSTRAINT_MASKING
+  if (decode_params.HasConstraintDecoder()) {
+    // SPECULATIVE PATH: Get unmasked GPU logits (bitmap precomputation
+    // started in parallel with GPU forward pass inside DecodeLogits).
+    ASSIGN_OR_RETURN(auto decoded_logits,
+                     DecodeLogits(ExecutorInputs(), decode_params,
+                                  /*skip_constraint_masking=*/true));
+
+    std::optional<TensorBuffer> output_tokens;
+    {
+      LITERT_ASSIGN_OR_RETURN(auto decoded_logits_type,
+                              decoded_logits.TensorType());
+      auto dimensions = decoded_logits_type.Layout().Dimensions();
+      // Shape of decoded_logits is [batch_size, Token_length, vocab_size].
+      RET_CHECK_EQ(dimensions.size(), 3);
+      LITERT_ASSIGN_OR_RETURN(
+          output_tokens,
+          CreateTensorBuffer<int>({dimensions[0], dimensions[1]}));
+    }
+
+    // Speculatively sample on GPU (no logits copy).
+    auto spec_token_or = SampleToken(decoded_logits);
+    if (spec_token_or.ok()) {
+      LITERT_ASSIGN_OR_RETURN(
+          auto spec_ids_span,
+          ReferTensorBufferAsSpan<int>(*spec_token_or));
+
+      // Validate against precomputed bitmap.
+      ASSIGN_OR_RETURN(
+          bool all_valid,
+          decode_params.GetConstraintDecoder()->ValidateSpeculativeTokens(
+              absl::MakeConstSpan(spec_ids_span.data(),
+                                  spec_ids_span.size())));
+
+      if (all_valid) {
+        // FAST PATH: accept token, no logits copy needed.
+        RETURN_IF_ERROR(
+            decode_params.GetConstraintDecoder()->AcceptSpeculativeTokens(
+                absl::MakeConstSpan(spec_ids_span.data(),
+                                    spec_ids_span.size())));
+        output_tokens->Write(absl::MakeConstSpan(
+            spec_ids_span.data(), spec_ids_span.size()));
+        sampled_speculatively = true;
+      }
+    }
+
+    if (!sampled_speculatively) {
+      // FALLBACK: apply precomputed mask and resample normally.
+      LITERT_ASSIGN_OR_RETURN(auto output_logits_buffer_type,
+                              decoded_logits.BufferType());
+      if (output_logits_buffer_type == TensorBufferType::kHostMemory) {
+        RETURN_IF_ERROR(decode_params.GetConstraintDecoder()
+                            ->ApplyPrecomputedMask(decoded_logits));
+      } else {
+        LITERT_ASSIGN_OR_RETURN(RankedTensorType logits_tensor_type,
+                                decoded_logits.TensorType());
+        if (logits_tensor_type.ElementType() == ElementType::Float32) {
+          LITERT_ASSIGN_OR_RETURN(
+              auto logits_vector,
+              CopyFromTensorBuffer<float>(decoded_logits));
+          RETURN_IF_ERROR(
+              decode_params.GetConstraintDecoder()->ApplyPrecomputedMask(
+                  absl::MakeSpan(logits_vector.data(), logits_vector.size()),
+                  logits_tensor_type.Layout().Dimensions()));
+          decoded_logits.Write(absl::MakeConstSpan(logits_vector.data(),
+                                                   logits_vector.size()));
+        } else {
+          return absl::InvalidArgumentError(
+              "Output logits are not in float32.");
+        }
+      }
+      RETURN_IF_ERROR(SampleLogits(decoded_logits, *output_tokens));
+
+      // After fallback sampling, advance constraint state with the sampled
+      // token so the next step's bitmap is computed from the correct state.
+      int output_heads = 1;
+      if (llm_context_->runtime_config().output_heads.has_value()) {
+        output_heads = llm_context_->runtime_config().output_heads.value();
+      }
+      LITERT_ASSIGN_OR_RETURN(
+          auto lock_and_addr,
+          TensorBufferScopedLock::Create(*output_tokens,
+                                         TensorBuffer::LockMode::kRead));
+      auto fallback_ids = absl::MakeSpan(
+          static_cast<int*>(lock_and_addr.second), output_heads);
+      RETURN_IF_ERROR(
+          decode_params.GetConstraintDecoder()->UpdateConstraintState(
+              fallback_ids));
+    }
+
+    LITERT_ASSIGN_OR_RETURN(std::vector<std::vector<int>> output_tokens_vector,
+                            CopyFromTensorBuffer2D<int>(*output_tokens));
+
+    // Check for any invalid token ids and set them to zero, if any.
+    bool has_invalid_output_token = false;
+    for (int batch = 0; batch < static_cast<int>(output_tokens_vector.size());
+         ++batch) {
+      for (int token_idx = 0;
+           token_idx < static_cast<int>(output_tokens_vector[batch].size());
+           ++token_idx) {
+        if (output_tokens_vector[batch][token_idx] < 0) {
+          has_invalid_output_token = true;
+          output_tokens_vector[batch][token_idx] = 0;
+        }
+      }
+    }
+    if (has_invalid_output_token) {
+      ABSL_LOG(WARNING) << "Invalid decode and sample result. The sampled "
+                           "token is casted to 0 to avoid crash.";
+    }
+
+    std::vector<std::shared_ptr<TokenData>> tokens;
+    tokens.reserve(output_tokens_vector.size());
+    for (auto& output_head_tokens : output_tokens_vector) {
+      RET_CHECK_EQ(output_head_tokens.size(), 1);
+      tokens.push_back(std::make_shared<TokenData>(output_head_tokens[0]));
+    }
+    RETURN_IF_ERROR(
+        llm_context_->processed_context().processed_tokens().AddPendingInputToken(
+            tokens));
+    return output_tokens_vector;
+  } else {
+    // No constraint decoder — standard decode + sample.
+    ASSIGN_OR_RETURN(auto decoded_logits,
+                     DecodeLogits(ExecutorInputs(), decode_params));
+    std::optional<TensorBuffer> output_tokens;
+    {
+      LITERT_ASSIGN_OR_RETURN(auto decoded_logits_type,
+                              decoded_logits.TensorType());
+      auto dimensions = decoded_logits_type.Layout().Dimensions();
+      RET_CHECK_EQ(dimensions.size(), 3);
+      LITERT_ASSIGN_OR_RETURN(
+          output_tokens,
+          CreateTensorBuffer<int>({dimensions[0], dimensions[1]}));
+    }
+    RETURN_IF_ERROR(SampleLogits(decoded_logits, *output_tokens));
+    LITERT_ASSIGN_OR_RETURN(std::vector<std::vector<int>> output_tokens_vector,
+                            CopyFromTensorBuffer2D<int>(*output_tokens));
+    bool has_invalid_output_token = false;
+    for (int batch = 0; batch < static_cast<int>(output_tokens_vector.size());
+         ++batch) {
+      for (int token_idx = 0;
+           token_idx < static_cast<int>(output_tokens_vector[batch].size());
+           ++token_idx) {
+        if (output_tokens_vector[batch][token_idx] < 0) {
+          has_invalid_output_token = true;
+          output_tokens_vector[batch][token_idx] = 0;
+        }
+      }
+    }
+    if (has_invalid_output_token) {
+      ABSL_LOG(WARNING) << "Invalid decode and sample result. The sampled "
+                           "token is casted to 0 to avoid crash.";
+    }
+    std::vector<std::shared_ptr<TokenData>> tokens;
+    tokens.reserve(output_tokens_vector.size());
+    for (auto& output_head_tokens : output_tokens_vector) {
+      RET_CHECK_EQ(output_head_tokens.size(), 1);
+      tokens.push_back(std::make_shared<TokenData>(output_head_tokens[0]));
+    }
+    RETURN_IF_ERROR(
+        llm_context_->processed_context().processed_tokens().AddPendingInputToken(
+            tokens));
+    return output_tokens_vector;
+  }
+#else
   ASSIGN_OR_RETURN(auto decoded_logits,
                    DecodeLogits(ExecutorInputs(), decode_params));
   std::optional<TensorBuffer> output_tokens;
@@ -1165,6 +1332,7 @@ LlmLiteRtCompiledModelExecutorBase::Decode(
           tokens));
 
   return output_tokens_vector;
+#endif  // LITERT_LM_ASYNC_CONSTRAINT_MASKING
 }
 
 absl::Status LlmLiteRtCompiledModelExecutorBase::Decode(
@@ -1184,6 +1352,14 @@ absl::StatusOr<TensorBuffer> LlmLiteRtCompiledModelExecutorBase::DecodeLogits(
 
 absl::StatusOr<TensorBuffer> LlmLiteRtCompiledModelExecutorBase::DecodeLogits(
     const ExecutorInputs& inputs, const ExecutorDecodeParams& decode_params) {
+#ifdef LITERT_LM_ASYNC_CONSTRAINT_MASKING
+  return DecodeLogits(inputs, decode_params, /*skip_constraint_masking=*/false);
+}
+
+absl::StatusOr<TensorBuffer> LlmLiteRtCompiledModelExecutorBase::DecodeLogits(
+    const ExecutorInputs& inputs, const ExecutorDecodeParams& decode_params,
+    bool skip_constraint_masking) {
+#endif
   LITERT_ASSIGN_OR_RETURN(
       auto output_logits,
       decode_output_buffers_[signatures_.output_logits].Duplicate());
@@ -1191,9 +1367,76 @@ absl::StatusOr<TensorBuffer> LlmLiteRtCompiledModelExecutorBase::DecodeLogits(
   bool last_run_is_decode = llm_context_->runtime_state().ran_decode;
   RETURN_IF_ERROR(PrepareFirstDecode());
   ASSIGN_OR_RETURN(auto step_and_token, GetTokenToDecode(inputs));
+
+#ifdef LITERT_LM_ASYNC_CONSTRAINT_MASKING
+  // When async masking is enabled, update constraint state and start bitmap
+  // precomputation BEFORE the GPU forward pass so they overlap.
+  if (decode_params.HasConstraintDecoder()) {
+    // When skip_constraint_masking is true, the caller (Decode) manages
+    // constraint state via AcceptSpeculativeTokens, so skip UpdateConstraintState
+    // to avoid double-advancing.
+    if (!skip_constraint_masking && !step_and_token.token.empty()) {
+      int output_heads = 1;
+      if (llm_context_->runtime_config().output_heads.has_value()) {
+        output_heads = llm_context_->runtime_config().output_heads.value();
+      }
+      RET_CHECK_EQ(step_and_token.token.size(), output_heads);
+      std::vector<int> current_token_ids;
+      current_token_ids.reserve(output_heads);
+      for (const auto& token : step_and_token.token) {
+        current_token_ids.push_back(token->id());
+      }
+      if (last_run_is_decode) {
+        RETURN_IF_ERROR(
+            decode_params.GetConstraintDecoder()->UpdateConstraintState(
+                absl::MakeSpan(current_token_ids)));
+      }
+    }
+    // Start async bitmap computation that will run in parallel with
+    // DecodeInternal (GPU forward pass).
+    if (!mask_thread_pool_) {
+      mask_thread_pool_ =
+          std::make_unique<ThreadPool>("constraint_mask", /*max_num_threads=*/1);
+    }
+    RETURN_IF_ERROR(decode_params.GetConstraintDecoder()->StartPrecomputeMask(
+        *mask_thread_pool_));
+  }
+#endif  // LITERT_LM_ASYNC_CONSTRAINT_MASKING
+
   RETURN_IF_ERROR(DecodeInternal(step_and_token.token, output_logits));
   RETURN_IF_ERROR(ConsumePendingOrAddProcessedToken(step_and_token.token));
 
+#ifdef LITERT_LM_ASYNC_CONSTRAINT_MASKING
+  if (decode_params.HasConstraintDecoder()) {
+    // When skip_constraint_masking is true, the caller will handle
+    // speculative sampling and mask application.
+    if (!skip_constraint_masking) {
+      // Apply the precomputed mask (waits for completion if still running).
+      LITERT_ASSIGN_OR_RETURN(auto output_logits_buffer_type,
+                              output_logits.BufferType());
+      if (output_logits_buffer_type == TensorBufferType::kHostMemory) {
+        RETURN_IF_ERROR(decode_params.GetConstraintDecoder()
+                            ->ApplyPrecomputedMask(output_logits));
+      } else {
+        LITERT_ASSIGN_OR_RETURN(RankedTensorType logits_tensor_type,
+                                output_logits.TensorType());
+        if (logits_tensor_type.ElementType() == ElementType::Float32) {
+          LITERT_ASSIGN_OR_RETURN(auto logits_vector,
+                                  CopyFromTensorBuffer<float>(output_logits));
+          RETURN_IF_ERROR(
+              decode_params.GetConstraintDecoder()->ApplyPrecomputedMask(
+                  absl::MakeSpan(logits_vector.data(), logits_vector.size()),
+                  logits_tensor_type.Layout().Dimensions()));
+          output_logits.Write(
+              absl::MakeConstSpan(logits_vector.data(), logits_vector.size()));
+        } else {
+          return absl::InvalidArgumentError(
+              "Output logits are not in float32.");
+        }
+      }
+    }
+  }
+#else
   if (decode_params.HasConstraintDecoder() && !step_and_token.token.empty()) {
     int output_heads = 1;
     if (llm_context_->runtime_config().output_heads.has_value()) {
@@ -1257,6 +1500,7 @@ absl::StatusOr<TensorBuffer> LlmLiteRtCompiledModelExecutorBase::DecodeLogits(
       }
     }
   }
+#endif  // LITERT_LM_ASYNC_CONSTRAINT_MASKING
 
   ++llm_context_->runtime_state().current_step;
 
@@ -1397,6 +1641,26 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::SampleLogits(
   RETURN_IF_ERROR(sampler_->SampleToIdAndScoreBuffer(
       logits, ids_tensor, /*scores_tensor=*/nullptr));
   return absl::OkStatus();
+}
+
+absl::StatusOr<TensorBuffer>
+LlmLiteRtCompiledModelExecutorBase::SampleToken(const TensorBuffer& logits) {
+  if (sampler_ == nullptr) {
+    RETURN_IF_ERROR(InitializeSampler(logits_data_type_));
+  }
+  int output_heads = 1;
+  if (llm_context_->runtime_config().output_heads.has_value()) {
+    output_heads = llm_context_->runtime_config().output_heads.value();
+  }
+  Dimensions dims = {output_heads};
+  LITERT_ASSIGN_OR_RETURN(
+      auto ids_tensor,
+      TensorBuffer::CreateManagedHostMemory(
+          RankedTensorType(ElementType::Int32, Layout(std::move(dims))),
+          output_heads * sizeof(int32_t)));
+  RETURN_IF_ERROR(sampler_->SampleToIdAndScoreBuffer(
+      logits, ids_tensor, /*scores_tensor=*/nullptr));
+  return std::move(ids_tensor);
 }
 
 absl::Status LlmLiteRtCompiledModelExecutorBase::UpdateExecutorSettings(

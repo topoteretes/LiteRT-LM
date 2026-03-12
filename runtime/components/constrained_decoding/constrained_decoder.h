@@ -26,6 +26,10 @@
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
 #include "runtime/components/constrained_decoding/constraint.h"
 #include "tflite/types/half.h"  // from @litert
+#ifdef LITERT_LM_ASYNC_CONSTRAINT_MASKING
+#include "absl/synchronization/mutex.h"  // from @com_google_absl
+#include "runtime/framework/threadpool.h"
+#endif
 
 namespace litert::lm {
 
@@ -97,12 +101,47 @@ class ConstrainedDecoder {
   // Returns a pointer to the constraint.
   Constraint* GetConstraint() const { return constraint_; }
 
+#ifdef LITERT_LM_ASYNC_CONSTRAINT_MASKING
+  // Starts computing the bitmap mask asynchronously on the provided thread
+  // pool. Must be called AFTER UpdateConstraintState for the current step.
+  // The precomputed mask can then be applied with ApplyPrecomputedMask().
+  absl::Status StartPrecomputeMask(ThreadPool& thread_pool);
+
+  // Waits for the precomputed mask and applies it to the logits.
+  // Must be called after StartPrecomputeMask().
+  absl::Status ApplyPrecomputedMask(::litert::TensorBuffer& logits);
+
+  // Same as above, but takes a span of logits instead of a tensor buffer.
+  absl::Status ApplyPrecomputedMask(
+      absl::Span<float> logits,
+      absl::Span<const ::litert::Layout::Dim> logits_dims);
+
+  // Validates speculative token IDs against the precomputed bitmap.
+  // Waits for precomputation if still running. Returns true if ALL
+  // batch elements have valid tokens. Does NOT clear bitmaps (retained
+  // for fallback via ApplyPrecomputedMask).
+  absl::StatusOr<bool> ValidateSpeculativeTokens(
+      absl::Span<const int> token_ids);
+
+  // Accepts validated tokens: advances constraint state via ComputeNext(),
+  // resets IsEnded states, then clears precomputed bitmaps.
+  absl::Status AcceptSpeculativeTokens(absl::Span<const int> token_ids);
+#endif
+
  private:
   // The constraint to be applied.
   Constraint* constraint_;
   const int batch_size_;
   // The current constraint states.
   std::vector<std::unique_ptr<Constraint::State>> constraint_states_;
+
+#ifdef LITERT_LM_ASYNC_CONSTRAINT_MASKING
+  absl::Mutex mask_mutex_;
+  std::vector<std::unique_ptr<Bitmap>> precomputed_bitmaps_
+      ABSL_GUARDED_BY(mask_mutex_);
+  bool mask_ready_ ABSL_GUARDED_BY(mask_mutex_) = false;
+  absl::Status mask_status_ ABSL_GUARDED_BY(mask_mutex_);
+#endif
 };
 
 }  // namespace litert::lm

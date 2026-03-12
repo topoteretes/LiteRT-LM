@@ -291,6 +291,7 @@ class LlmLiteRtNpuCompiledModelExecutor : public LlmExecutor {
   static absl::StatusOr<InferenceContext>
   CreateLlmInferenceContextWithBufferSharing(
       ::litert::Environment& env, ::litert::CompiledModel& llm_compiled_model,
+      absl::string_view prefill_signature,
       absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&
           input_kv_cache_buffers,
       absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&
@@ -316,6 +317,7 @@ class LlmLiteRtNpuCompiledModelExecutor : public LlmExecutor {
   // intended to be called before the first actual inference.
   static absl::Status WarmupInference(
       ::litert::CompiledModel& compiled_model_llm,
+      absl::string_view prefill_signature,
       InferenceContext& llm_inference_context,
       ::litert::CompiledModel& compiled_model_auxiliary,
       const InferenceContext& rope_inference_context,
@@ -336,6 +338,7 @@ class LlmLiteRtNpuCompiledModelExecutor : public LlmExecutor {
   static absl::Status AllocateTransformerBuffers(
       litert::Environment& env, const litert::Model* transformer_model,
       CompiledModel& llm_compiled_model,
+      absl::string_view prefill_signature,
       absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&
           gemma_prefill_input_buffers,
       absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&

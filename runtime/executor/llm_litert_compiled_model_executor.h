@@ -44,6 +44,9 @@
 #include "runtime/executor/llm_executor_processed_tokens.h"
 #include "runtime/executor/llm_executor_settings.h"
 #include "runtime/executor/llm_processed_context.h"
+#ifdef LITERT_LM_ASYNC_CONSTRAINT_MASKING
+#include "runtime/framework/threadpool.h"
+#endif
 
 namespace litert::lm {
 
@@ -84,6 +87,18 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
 
   absl::StatusOr<TensorBuffer> DecodeLogits(
       const ExecutorInputs& inputs, const ExecutorDecodeParams& decode_params);
+
+#ifdef LITERT_LM_ASYNC_CONSTRAINT_MASKING
+  // DecodeLogits variant that optionally skips constraint mask application,
+  // allowing the caller to handle speculative sampling before masking.
+  absl::StatusOr<TensorBuffer> DecodeLogits(
+      const ExecutorInputs& inputs, const ExecutorDecodeParams& decode_params,
+      bool skip_constraint_masking);
+#endif
+
+  // Samples token(s) from logits using the executor's internal sampler.
+  absl::StatusOr<TensorBuffer> SampleToken(
+      const TensorBuffer& logits) override;
 
   absl::string_view ExecutorBackendName() const override {
     return "LiteRT Compiled Model";
@@ -325,6 +340,11 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
 
   // GPU optimized single buffer cache
   bool gpu_optimized_single_buffer_cache_ = false;
+
+#ifdef LITERT_LM_ASYNC_CONSTRAINT_MASKING
+  // Thread pool for async constraint mask precomputation.
+  std::unique_ptr<ThreadPool> mask_thread_pool_;
+#endif
 
   // The MTP drafter model.
   std::unique_ptr<CompiledModel> mtp_drafter_model_;
