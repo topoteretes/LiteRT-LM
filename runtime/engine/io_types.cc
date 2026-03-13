@@ -387,6 +387,17 @@ uint64_t BenchmarkInfo::GetTotalPrefillTurns() const {
   return prefill_turns_.size();
 }
 
+double BenchmarkInfo::GetTotalGenerationTimeSec() const {
+  absl::Duration total;
+  for (const auto& turn : prefill_turns_) {
+    total += turn.duration;
+  }
+  for (const auto& turn : decode_turns_) {
+    total += turn.duration;
+  }
+  return absl::ToDoubleSeconds(total);
+}
+
 double BenchmarkInfo::GetPrefillTokensPerSec(int turn_index) const {
   if (turn_index < 0 ||
       static_cast<size_t>(turn_index) >= prefill_turns_.size()) {
@@ -500,6 +511,8 @@ std::ostream& operator<<(std::ostream& os, const BenchmarkInfo& info) {
 
   os << "--------------------------------------------------" << std::endl;
   os << "  Time to first token: " << info.GetTimeToFirstToken() << " s"
+     << std::endl;
+  os << "  Total Time: " << info.GetTotalGenerationTimeSec() << " s"
      << std::endl;
 
   os << "--------------------------------------------------" << std::endl;

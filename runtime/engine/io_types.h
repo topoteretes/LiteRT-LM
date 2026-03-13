@@ -486,6 +486,9 @@ class BenchmarkInfo {
   // the time spent for decoding the first token.
   double GetTimeToFirstToken() const;
 
+  // --- Gets total generation time (prefill + decode) in seconds ---
+  double GetTotalGenerationTimeSec() const;
+
  private:
   proto::BenchmarkParams benchmark_params_;
 

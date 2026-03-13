@@ -1186,9 +1186,19 @@ LlmLiteRtCompiledModelExecutorBase::Decode(
                   logits_tensor_type.Layout().Dimensions()));
           decoded_logits.Write(absl::MakeConstSpan(logits_vector.data(),
                                                    logits_vector.size()));
+        } else if (logits_tensor_type.ElementType() == ElementType::Float16) {
+          LITERT_ASSIGN_OR_RETURN(
+              auto logits_vector,
+              CopyFromTensorBuffer<tflite::half>(decoded_logits));
+          RETURN_IF_ERROR(
+              decode_params.GetConstraintDecoder()->ApplyPrecomputedMask(
+                  absl::MakeSpan(logits_vector.data(), logits_vector.size()),
+                  logits_tensor_type.Layout().Dimensions()));
+          decoded_logits.Write(absl::MakeConstSpan(logits_vector.data(),
+                                                   logits_vector.size()));
         } else {
           return absl::InvalidArgumentError(
-              "Output logits are not in float32.");
+              "Output logits are not in float32 or float16.");
         }
       }
       RETURN_IF_ERROR(SampleLogits(decoded_logits, *output_tokens));

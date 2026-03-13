@@ -170,9 +170,18 @@ absl::Status ConstrainedDecoder::StartPrecomputeMask(ThreadPool& thread_pool) {
 absl::Status ConstrainedDecoder::ApplyPrecomputedMask(
     ::litert::TensorBuffer& logits) {
   LITERT_ASSIGN_OR_RETURN(auto logits_tensor_type, logits.TensorType());
-  LITERT_ASSIGN_OR_RETURN(auto logits_span, ReferTensorBufferAsSpan<float>(logits));
-  return ApplyPrecomputedMask(logits_span,
-                              logits_tensor_type.Layout().Dimensions());
+  if (logits_tensor_type.ElementType() == ::litert::ElementType::Float32) {
+    LITERT_ASSIGN_OR_RETURN(auto logits_span, ReferTensorBufferAsSpan<float>(logits));
+    return ApplyPrecomputedMask(logits_span,
+                                logits_tensor_type.Layout().Dimensions());
+  } else if (logits_tensor_type.ElementType() == ::litert::ElementType::Float16) {
+    LITERT_ASSIGN_OR_RETURN(auto logits_span,
+                            ReferTensorBufferAsSpan<tflite::half>(logits));
+    return ApplyPrecomputedMask(logits_span,
+                                logits_tensor_type.Layout().Dimensions());
+  }
+  return absl::InvalidArgumentError(
+      "Unsupported logits type for ApplyPrecomputedMask.");
 }
 
 absl::Status ConstrainedDecoder::ApplyPrecomputedMask(
@@ -206,6 +215,50 @@ absl::Status ConstrainedDecoder::ApplyPrecomputedMask(
       if (!bitmap->Get(i)) {
         logits.data()[b * vocab_size + i] =
             std::numeric_limits<float>::lowest();
+      }
+    }
+  }
+
+  // Reset for next step.
+  {
+    absl::MutexLock lock(&mask_mutex_);
+    mask_ready_ = false;
+    precomputed_bitmaps_.clear();
+  }
+
+  return absl::OkStatus();
+}
+
+absl::Status ConstrainedDecoder::ApplyPrecomputedMask(
+    absl::Span<tflite::half> logits,
+    absl::Span<const ::litert::Layout::Dim> logits_dims) {
+  RET_CHECK_EQ(logits_dims.size(), 3)
+      << "Only support logits with dimensions [batch_size, 1, vocab_size].";
+  int batch_size = logits_dims[0];
+  int sequence_length = logits_dims[1];
+  int vocab_size = logits_dims[2];
+  RET_CHECK_EQ(sequence_length, 1) << "Only support sequence length 1.";
+  RET_CHECK_LE(vocab_size, constraint_->GetVocabularySize())
+      << "Vocabulary size [" << vocab_size
+      << "] does not match the expected vocabulary size ["
+      << constraint_->GetVocabularySize() << "].";
+  RET_CHECK_EQ(batch_size, batch_size_)
+      << "Batch size [" << batch_size
+      << "] does not match the expected batch size [" << batch_size_ << "].";
+
+  // Wait for the precomputed bitmaps to be ready.
+  {
+    absl::MutexLock lock(&mask_mutex_);
+    mask_mutex_.Await(absl::Condition(&mask_ready_));
+    RETURN_IF_ERROR(mask_status_);
+  }
+
+  // Apply the precomputed bitmaps to the logits.
+  for (int b = 0; b < batch_size; ++b) {
+    const auto& bitmap = precomputed_bitmaps_[b];
+    for (int i = 0; i < vocab_size; ++i) {
+      if (!bitmap->Get(i)) {
+        logits.data()[b * vocab_size + i] = tflite::half::min();
       }
     }
   }

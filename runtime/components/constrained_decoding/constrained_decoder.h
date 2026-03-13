@@ -116,6 +116,11 @@ class ConstrainedDecoder {
       absl::Span<float> logits,
       absl::Span<const ::litert::Layout::Dim> logits_dims);
 
+  // Same as above, but for half-precision (Float16) logits.
+  absl::Status ApplyPrecomputedMask(
+      absl::Span<tflite::half> logits,
+      absl::Span<const ::litert::Layout::Dim> logits_dims);
+
   // Validates speculative token IDs against the precomputed bitmap.
   // Waits for precomputation if still running. Returns true if ALL
   // batch elements have valid tokens. Does NOT clear bitmaps (retained
