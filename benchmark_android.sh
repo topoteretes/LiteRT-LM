@@ -7,6 +7,9 @@
 
 set -euo pipefail
 
+# Ensure output is not buffered
+exec 2>&1
+
 export PATH="/home/dmytro/Android/Sdk/platform-tools:$PATH"
 export ANDROID_HOME="/home/dmytro/Android/Sdk"
 
@@ -50,6 +53,49 @@ QNN_SYSTEM_SO="${QNN_SYSTEM_SO:-$(find_qairt_file 'aarch64-android/libQnnSystem.
 QNN_HTP_SKEL_SO="${QNN_HTP_SKEL_SO:-$(find_qairt_file 'hexagon-v75/unsigned/libQnnHtpV75Skel.so')}"
 QNN_HTP_STUB_SO="${QNN_HTP_STUB_SO:-$(find_qairt_file 'aarch64-android/libQnnHtpV75Stub.so')}"
 
+# Function to build NPU dependencies if missing
+build_npu_dependencies() {
+  echo ""
+  echo "Building NPU runtime dependencies (this may take 3-5 minutes)..."
+  echo "Building litert_lm_main to generate Qualcomm dispatch + QNN libraries..."
+  
+  # Build main target which pulls in all NPU dependencies
+  bazel build --config=android_arm64 //runtime/engine:litert_lm_main \
+    --define=litert_link_capi_so=true \
+    --define=resolve_symbols_in_exec=false 2>&1 | tail -5
+  
+  echo "Locating built libraries..."
+  
+  # Re-find the libraries now that they should exist
+  DISPATCH_SO=$(find_first_file \
+    "$PWD/bazel-bin/external/litert/litert/vendors/qualcomm/dispatch/libLiteRtDispatch_Qualcomm.so" \
+    "$PWD/bazel-out/arm64-v8a-opt/bin/external/litert/litert/vendors/qualcomm/dispatch/libLiteRtDispatch_Qualcomm.so" \
+    "$HOME/.cache/bazel/_bazel_dmytro/4aa95d11f0e0f122dfcdd727d11fcb01/execroot/litert_lm/bazel-out/arm64-v8a-opt/bin/external/litert/litert/vendors/qualcomm/dispatch/libLiteRtDispatch_Qualcomm.so")
+  
+  QNN_HTP_SO=$(find_qairt_file 'aarch64-android/libQnnHtp.so')
+  QNN_PREPARE_SO=$(find_qairt_file 'aarch64-android/libQnnHtpPrepare.so')
+  QNN_SYSTEM_SO=$(find_qairt_file 'aarch64-android/libQnnSystem.so')
+  QNN_HTP_SKEL_SO=$(find_qairt_file 'hexagon-v75/unsigned/libQnnHtpV75Skel.so')
+  QNN_HTP_STUB_SO=$(find_qairt_file 'aarch64-android/libQnnHtpV75Stub.so')
+  
+  # Verify all were found
+  local all_found=true
+  for lib_name in "DISPATCH_SO" "QNN_HTP_SO" "QNN_PREPARE_SO" "QNN_SYSTEM_SO" "QNN_HTP_SKEL_SO" "QNN_HTP_STUB_SO"; do
+    eval "lib_path=\$$lib_name"
+    if [[ -z "$lib_path" || ! -f "$lib_path" ]]; then
+      echo "ERROR: Failed to build/locate $lib_name after build attempt"
+      all_found=false
+    fi
+  done
+  
+  if [ "$all_found" = false ]; then
+    echo "ERROR: Some NPU libraries could not be built. Check bazel output above."
+    exit 1
+  fi
+  
+  echo "✓ All NPU dependencies built successfully"
+}
+
 SKIP_BUILD=false
 SKIP_PUSH=false
 for arg in "$@"; do
@@ -80,13 +126,21 @@ if [ ! -f "$MODEL_LOCAL_NPU" ]; then
   exit 1
 fi
 
+# Check for NPU runtime libraries, build if missing
+missing_libs=false
 for f in "$DISPATCH_SO" "$QNN_HTP_SO" "$QNN_PREPARE_SO" "$QNN_SYSTEM_SO" "$QNN_HTP_SKEL_SO" "$QNN_HTP_STUB_SO"; do
   if [[ -z "$f" || ! -f "$f" ]]; then
-    echo "ERROR: Missing required NPU runtime library: ${f:-<empty>}"
-    echo "Hint: build //runtime/engine:litert_lm_main with --config=android_arm64 first."
-    exit 1
+    missing_libs=true
+    break
   fi
 done
+
+if [ "$missing_libs" = true ]; then
+  echo "⚠️  NPU runtime libraries not found in build cache."
+  build_npu_dependencies
+else
+  echo "✓ All NPU runtime libraries found"
+fi
 
 # --- 2. Build ---
 if [ "$SKIP_BUILD" = false ]; then

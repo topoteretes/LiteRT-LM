@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Knowledge graph extraction demo using LiteRT-LM with constrained decoding.
+// Knowledge graph extraction demo using LiteRT-LM C API with constrained
+// decoding.
 //
 // Given an input text document, prompts the LLM to extract entities (nodes)
 // and relationships (edges) and output them as a JSON object conforming to a
@@ -25,31 +26,14 @@
 
 #include <fstream>
 #include <iostream>
-#include <memory>
 #include <sstream>
 #include <string>
-#include <utility>
 
-#include "absl/base/log_severity.h"  // from @com_google_absl
 #include "absl/flags/flag.h"  // from @com_google_absl
 #include "absl/flags/parse.h"  // from @com_google_absl
-#include "absl/functional/any_invocable.h"  // from @com_google_absl
 #include "absl/log/absl_check.h"  // from @com_google_absl
-#include "absl/log/globals.h"  // from @com_google_absl
-#include "absl/status/status.h"  // from @com_google_absl
-#include "absl/status/statusor.h"  // from @com_google_absl
-#include "absl/time/time.h"  // from @com_google_absl
+#include "c/engine.h"
 #include "nlohmann/json.hpp"  // from @nlohmann_json
-#include "runtime/components/constrained_decoding/constraint_provider_config.h"
-#include "runtime/components/constrained_decoding/llg_constraint_config.h"
-#include "runtime/conversation/conversation.h"
-#include "runtime/conversation/io_types.h"
-#include "runtime/engine/engine.h"
-#include "runtime/engine/engine_factory.h"
-#include "runtime/engine/engine_settings.h"
-#include "runtime/engine/io_types.h"
-#include "runtime/executor/executor_settings_base.h"
-#include "runtime/util/status_macros.h"
 
 ABSL_FLAG(std::string, model_path, "", "Path to the .litertlm model file.");
 ABSL_FLAG(std::string, backend, "cpu", "Backend to use (cpu, gpu, npu).");
@@ -62,18 +46,6 @@ ABSL_FLAG(std::string, litert_dispatch_lib_dir, "",
 
 namespace {
 
-using ::litert::lm::Backend;
-using ::litert::lm::Conversation;
-using ::litert::lm::ConversationConfig;
-using ::litert::lm::ConstraintProviderConfig;
-using ::litert::lm::Engine;
-using ::litert::lm::EngineSettings;
-using ::litert::lm::LlGuidanceConfig;
-using ::litert::lm::LlGuidanceConstraintArg;
-using ::litert::lm::LlgConstraintType;
-using ::litert::lm::Message;
-using ::litert::lm::ModelAssets;
-using ::litert::lm::OptionalArgs;
 using ::nlohmann::json;
 
 // System prompt instructing the LLM to extract knowledge graph from text.
@@ -136,13 +108,16 @@ constexpr char kKnowledgeGraphSchema[] = R"json({
 })json";
 
 // Reads all text from the given file path.
-absl::StatusOr<std::string> ReadTextFile(const std::string& path) {
+std::string ReadTextFile(const std::string& path, bool* success) {
   std::ifstream file(path);
   if (!file.is_open()) {
-    return absl::NotFoundError("Could not open file: " + path);
+    std::cerr << "Could not open file: " << path << std::endl;
+    *success = false;
+    return "";
   }
   std::stringstream buffer;
   buffer << file.rdbuf();
+  *success = true;
   return buffer.str();
 }
 
@@ -174,69 +149,98 @@ std::string ExtractFirstJsonObject(const std::string& text) {
   return text;
 }
 
-absl::Status Run(int argc, char** argv) {
+int Run(int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
 
   const std::string model_path = absl::GetFlag(FLAGS_model_path);
   if (model_path.empty()) {
-    return absl::InvalidArgumentError("--model_path is required.");
+    std::cerr << "--model_path is required." << std::endl;
+    return 1;
   }
   const std::string input_text = absl::GetFlag(FLAGS_input_text);
   const std::string input_text_file = absl::GetFlag(FLAGS_input_text_file);
   if (input_text.empty() && input_text_file.empty()) {
-    return absl::InvalidArgumentError(
-        "One of --input_text or --input_text_file is required.");
+    std::cerr << "One of --input_text or --input_text_file is required."
+              << std::endl;
+    return 1;
   }
   if (!input_text.empty() && !input_text_file.empty()) {
-    return absl::InvalidArgumentError(
-        "Only one of --input_text or --input_text_file may be specified.");
+    std::cerr
+        << "Only one of --input_text or --input_text_file may be specified."
+        << std::endl;
+    return 1;
   }
 
   std::string source_text = input_text;
   if (!input_text_file.empty()) {
-    ASSIGN_OR_RETURN(source_text, ReadTextFile(input_text_file));
+    bool success = false;
+    source_text = ReadTextFile(input_text_file, &success);
+    if (!success) {
+      return 1;
+    }
   }
 
   // Suppress all log output so only the JSON result is printed.
-  absl::SetMinLogLevel(absl::LogSeverityAtLeast::kFatal);
-  absl::SetStderrThreshold(absl::LogSeverityAtLeast::kFatal);
+  litert_lm_set_min_log_level(3);  // 3 = FATAL
 
-  ASSIGN_OR_RETURN(auto model_assets, ModelAssets::Create(model_path));
-  ASSIGN_OR_RETURN(Backend backend,
-                   litert::lm::GetBackendFromString(absl::GetFlag(FLAGS_backend)));
-  ASSIGN_OR_RETURN(
-      EngineSettings engine_settings,
-      EngineSettings::CreateDefault(std::move(model_assets), backend));
+  // Create engine settings
+  const std::string backend_str = absl::GetFlag(FLAGS_backend);
+  LiteRtLmEngineSettings* engine_settings = litert_lm_engine_settings_create(
+      model_path.c_str(), backend_str.c_str(),
+      /*vision_backend_str=*/nullptr, /*audio_backend_str=*/nullptr);
+  if (!engine_settings) {
+    std::cerr << "Failed to create engine settings" << std::endl;
+    return 1;
+  }
 
+  //set dispatch lib dir if provided
   const std::string dispatch_lib_dir =
       absl::GetFlag(FLAGS_litert_dispatch_lib_dir);
   if (!dispatch_lib_dir.empty()) {
-    engine_settings.GetMutableMainExecutorSettings().SetLitertDispatchLibDir(
-        dispatch_lib_dir);
+    // Note: The C API doesn't expose SetLitertDispatchLibDir yet.
+    // This would need to be added if required for NPU support.
+    std::cerr << "Warning: --litert_dispatch_lib_dir not supported in C API yet"
+              << std::endl;
   }
 
-  engine_settings.GetMutableBenchmarkParams() =
-      litert::lm::proto::BenchmarkParams();
+  // Enable benchmarking
+  litert_lm_engine_settings_enable_benchmark(engine_settings);
 
-  ASSIGN_OR_RETURN(auto engine,
-                   litert::lm::EngineFactory::CreateAny(
-                       std::move(engine_settings)));
+  // Create engine
+  LiteRtLmEngine* engine = litert_lm_engine_create(engine_settings);
+  litert_lm_engine_settings_delete(engine_settings);
+  if (!engine) {
+    std::cerr << "Failed to create engine" << std::endl;
+    return 1;
+  }
 
-  auto session_config = litert::lm::SessionConfig::CreateDefault();
-  session_config.SetMaxOutputTokens(2048);
+  // Create session config
+  LiteRtLmSessionConfig* session_config = litert_lm_session_config_create();
+  litert_lm_session_config_set_max_output_tokens(session_config, 2048);
 
+  // Create conversation config
   const bool enable_constrained_decoding = absl::GetFlag(FLAGS_add_constraint);
-  ASSIGN_OR_RETURN(
-      auto conversation_config,
-      ConversationConfig::Builder()
-          .SetSessionConfig(session_config)
-          .SetEnableConstrainedDecoding(enable_constrained_decoding)
-          .SetConstraintProviderConfig(
-              ConstraintProviderConfig(LlGuidanceConfig()))
-          .Build(*engine));
+  LiteRtLmConversationConfig* conversation_config =
+      litert_lm_conversation_config_create(
+          engine, session_config,
+          /*system_message_json=*/nullptr, /*tools_json=*/nullptr,
+          /*messages_json=*/nullptr, enable_constrained_decoding);
+  litert_lm_session_config_delete(session_config);
+  if (!conversation_config) {
+    std::cerr << "Failed to create conversation config" << std::endl;
+    litert_lm_engine_delete(engine);
+    return 1;
+  }
 
-  ASSIGN_OR_RETURN(auto conversation,
-                   Conversation::Create(*engine, conversation_config));
+  // Create conversation
+  LiteRtLmConversation* conversation =
+      litert_lm_conversation_create(engine, conversation_config);
+  litert_lm_conversation_config_delete(conversation_config);
+  if (!conversation) {
+    std::cerr << "Failed to create conversation" << std::endl;
+    litert_lm_engine_delete(engine);
+    return 1;
+  }
 
   // Build the prompt: system instructions + compact schema + source text.
   const std::string compact_schema =
@@ -246,37 +250,67 @@ absl::Status Run(int argc, char** argv) {
       "\n\nText to extract from:\n" + source_text +
       "\n\nKnowledge graph JSON:\n";
 
+  // Create message JSON
   json content_list = json::array();
   content_list.push_back({{"type", "text"}, {"text", prompt}});
+  json message_json =
+      json::object({{"role", "user"}, {"content", content_list}});
+  std::string message_str = message_json.dump();
 
-  // Accumulate the full response text.
+  // Create optional args with constraint if enabled
+  LiteRtLmOptionalArgs* optional_args = nullptr;
+  if (enable_constrained_decoding) {
+    optional_args = litert_lm_optional_args_create();
+    litert_lm_optional_args_set_llg_constraint(
+        optional_args, kLlgConstraintJsonSchema, kKnowledgeGraphSchema);
+  }
+
+  // Send message and get response
+  LiteRtLmJsonResponse* response = litert_lm_conversation_send_message_with_args(
+      conversation, message_str.c_str(), optional_args);
+
+  if (optional_args) {
+    litert_lm_optional_args_delete(optional_args);
+  }
+
+  if (!response) {
+    std::cerr << "Failed to send message" << std::endl;
+    litert_lm_conversation_delete(conversation);
+    litert_lm_engine_delete(engine);
+    return 1;
+  }
+
+  // Get response string and parse
+  const char* response_str = litert_lm_json_response_get_string(response);
+  if (!response_str) {
+    std::cerr << "Failed to get response string" << std::endl;
+    litert_lm_json_response_delete(response);
+    litert_lm_conversation_delete(conversation);
+    litert_lm_engine_delete(engine);
+    return 1;
+  }
+
+  // Parse the response JSON
   std::string full_response;
-  auto callback = [&full_response](absl::StatusOr<Message> message) {
-    if (!message.ok()) return;
-    if (std::holds_alternative<litert::lm::JsonMessage>(*message)) {
-      const auto& json_msg = std::get<litert::lm::JsonMessage>(*message);
-      if (json_msg.is_null()) return;
-      for (const auto& content : json_msg["content"]) {
+  try {
+    json response_json = json::parse(response_str);
+    if (response_json.contains("content") &&
+        response_json["content"].is_array()) {
+      for (const auto& content : response_json["content"]) {
         if (content.contains("text")) {
           full_response += content["text"].get<std::string>();
         }
       }
     }
-  };
-
-  // Attach per-request constraint arg when constrained decoding is enabled.
-  OptionalArgs optional_args;
-  if (enable_constrained_decoding) {
-    optional_args.decoding_constraint = LlGuidanceConstraintArg{
-        .constraint_type = LlgConstraintType::kJsonSchema,
-        .constraint_string = kKnowledgeGraphSchema,
-    };
+  } catch (const std::exception& e) {
+    std::cerr << "Failed to parse response: " << e.what() << std::endl;
+    litert_lm_json_response_delete(response);
+    litert_lm_conversation_delete(conversation);
+    litert_lm_engine_delete(engine);
+    return 1;
   }
 
-  RETURN_IF_ERROR(conversation->SendMessageAsync(
-      json::object({{"role", "user"}, {"content", content_list}}),
-      std::move(callback), std::move(optional_args)));
-  RETURN_IF_ERROR(engine->WaitUntilDone(absl::Minutes(10)));
+  litert_lm_json_response_delete(response);
 
   // Try to parse the response as JSON; fall back to brace extraction.
   std::string result_json;
@@ -296,17 +330,63 @@ absl::Status Run(int argc, char** argv) {
   std::cout << result_json << std::endl;
 
   // Print benchmark info.
-  auto benchmark_info = conversation->GetBenchmarkInfo();
-  if (benchmark_info.ok()) {
-    std::cerr << std::endl << *benchmark_info << std::endl;
+  LiteRtLmBenchmarkInfo* benchmark_info =
+      litert_lm_conversation_get_benchmark_info(conversation);
+  if (benchmark_info) {
+    double ttft = litert_lm_benchmark_info_get_time_to_first_token(
+        benchmark_info);
+    double init_time =
+        litert_lm_benchmark_info_get_total_init_time_in_second(benchmark_info);
+    int num_prefill =
+        litert_lm_benchmark_info_get_num_prefill_turns(benchmark_info);
+    int num_decode =
+        litert_lm_benchmark_info_get_num_decode_turns(benchmark_info);
+
+    // Calculate aggregate metrics for benchmark script parsing
+    double total_prefill_tokens = 0;
+    double total_prefill_time = 0;
+    for (int i = 0; i < num_prefill; ++i) {
+      int tokens = litert_lm_benchmark_info_get_prefill_token_count_at(
+          benchmark_info, i);
+      double tps = litert_lm_benchmark_info_get_prefill_tokens_per_sec_at(
+          benchmark_info, i);
+      total_prefill_tokens += tokens;
+      if (tps > 0) total_prefill_time += tokens / tps;
+    }
+
+    double total_decode_tokens = 0;
+    double total_decode_time = 0;
+    for (int i = 0; i < num_decode; ++i) {
+      int tokens =
+          litert_lm_benchmark_info_get_decode_token_count_at(benchmark_info, i);
+      double tps = litert_lm_benchmark_info_get_decode_tokens_per_sec_at(
+          benchmark_info, i);
+      total_decode_tokens += tokens;
+      if (tps > 0) total_decode_time += tokens / tps;
+    }
+
+    double avg_prefill_speed = total_prefill_time > 0 ? total_prefill_tokens / total_prefill_time : 0;
+    double avg_decode_speed = total_decode_time > 0 ? total_decode_tokens / total_decode_time : 0;
+    double total_time = init_time + total_prefill_time + total_decode_time;
+
+    // Output in format expected by benchmark_android.sh
+    std::cerr << "\nPrefill Speed: " << avg_prefill_speed << " tokens/sec\n";
+    std::cerr << "Decode Speed: " << avg_decode_speed << " tokens/sec\n";
+    std::cerr << "Total Time: " << total_time << " s\n";
+    std::cerr << "Time to first token: " << ttft << " s\n";
+
+    litert_lm_benchmark_info_delete(benchmark_info);
   }
 
-  return absl::OkStatus();
+  // Cleanup
+  litert_lm_conversation_delete(conversation);
+  litert_lm_engine_delete(engine);
+
+  return 0;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  ABSL_CHECK_OK(Run(argc, argv));
-  return 0;
+  return Run(argc, argv);
 }

@@ -62,6 +62,21 @@ typedef struct LiteRtLmSessionConfig LiteRtLmSessionConfig;
 // Opaque pointer for LiteRT LM Conversation Config.
 typedef struct LiteRtLmConversationConfig LiteRtLmConversationConfig;
 
+// Opaque pointer for LiteRT LM Optional Args.
+typedef struct LiteRtLmOptionalArgs LiteRtLmOptionalArgs;
+
+// Represents the type of constraint for constrained decoding.
+typedef enum {
+  // Constrain model output to follow the given regular expression.
+  kLlgConstraintRegex = 0,
+  // Constrain model output to follow the given JSON schema.
+  kLlgConstraintJsonSchema = 1,
+  // Constrain model output to follow the given Lark grammar.
+  kLlgConstraintLark = 2,
+  // Constrain model output to follow the given LLGuidance-internal format.
+  kLlgConstraintInternal = 3,
+} LlgConstraintType;
+
 // Represents the type of sampler.
 typedef enum {
   kTypeUnspecified = 0,
@@ -490,6 +505,69 @@ void litert_lm_conversation_cancel_process(LiteRtLmConversation* conversation);
 LITERT_LM_C_API_EXPORT
 LiteRtLmBenchmarkInfo* litert_lm_conversation_get_benchmark_info(
     LiteRtLmConversation* conversation);
+
+// Creates optional arguments for sending messages to the conversation.
+// The caller is responsible for destroying the optional args using
+// `litert_lm_optional_args_delete`.
+//
+// @return A pointer to the created optional args, or NULL on failure.
+LITERT_LM_C_API_EXPORT
+LiteRtLmOptionalArgs* litert_lm_optional_args_create();
+
+// Sets the decoding constraint for the optional args (for LLGuidance provider).
+//
+// @param optional_args The optional args to modify.
+// @param constraint_type The type of constraint (regex, json_schema, etc.).
+// @param constraint_string The constraint string (e.g., JSON schema).
+LITERT_LM_C_API_EXPORT
+void litert_lm_optional_args_set_llg_constraint(
+    LiteRtLmOptionalArgs* optional_args, LlgConstraintType constraint_type,
+    const char* constraint_string);
+
+// Sets the maximum output tokens for this specific message.
+//
+// @param optional_args The optional args to modify.
+// @param max_output_tokens The maximum number of output tokens.
+LITERT_LM_C_API_EXPORT
+void litert_lm_optional_args_set_max_output_tokens(
+    LiteRtLmOptionalArgs* optional_args, int max_output_tokens);
+
+// Destroys optional arguments.
+//
+// @param optional_args The optional args to destroy.
+LITERT_LM_C_API_EXPORT
+void litert_lm_optional_args_delete(LiteRtLmOptionalArgs* optional_args);
+
+// Sends a message to the conversation with optional arguments and returns the
+// response. This is a blocking call.
+//
+// @param conversation The conversation to use.
+// @param message_json A JSON string representing the message to send.
+// @param optional_args Optional arguments for the message, or NULL for defaults.
+// @return A pointer to the JSON response, or NULL on failure. The caller is
+//   responsible for deleting the response using
+//   `litert_lm_json_response_delete`.
+LITERT_LM_C_API_EXPORT
+LiteRtLmJsonResponse* litert_lm_conversation_send_message_with_args(
+    LiteRtLmConversation* conversation, const char* message_json,
+    const LiteRtLmOptionalArgs* optional_args);
+
+// Sends a message to the conversation with optional arguments and streams the
+// response via a callback. This is a non-blocking call that will invoke the
+// callback from a background thread for each chunk.
+//
+// @param conversation The conversation to use.
+// @param message_json A JSON string representing the message to send.
+// @param optional_args Optional arguments for the message, or NULL for defaults.
+// @param callback The callback function to receive response chunks.
+// @param callback_data A pointer to user data that will be passed to the
+// callback.
+// @return 0 on success, non-zero on failure to start the stream.
+LITERT_LM_C_API_EXPORT
+int litert_lm_conversation_send_message_stream_with_args(
+    LiteRtLmConversation* conversation, const char* message_json,
+    const LiteRtLmOptionalArgs* optional_args,
+    LiteRtLmStreamCallback callback, void* callback_data);
 
 #ifdef __cplusplus
 }  // extern "C"

@@ -39,6 +39,8 @@ ENGINE_COMMON_DEPS = [
     "@com_google_absl//absl/time",
     "@nlohmann_json//:json",
     "@litert//litert/c/internal:litert_logging",
+    "//runtime/components/constrained_decoding:constraint_provider_config",
+    "//runtime/components/constrained_decoding:llg_constraint_config",
     "//runtime/conversation",
     "//runtime/conversation:io_types",
     "//runtime/engine:engine_factory",

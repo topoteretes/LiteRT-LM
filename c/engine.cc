@@ -30,6 +30,8 @@
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json
+#include "runtime/components/constrained_decoding/constraint_provider_config.h"
+#include "runtime/components/constrained_decoding/llg_constraint_config.h"
 #include "runtime/conversation/conversation.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/engine/engine.h"
@@ -139,6 +141,10 @@ struct LiteRtLmSessionConfig {
 
 struct LiteRtLmConversationConfig {
   std::unique_ptr<ConversationConfig> config;
+};
+
+struct LiteRtLmOptionalArgs {
+  litert::lm::OptionalArgs optional_args;
 };
 
 extern "C" {
@@ -760,6 +766,172 @@ LiteRtLmBenchmarkInfo* litert_lm_conversation_get_benchmark_info(
     return nullptr;
   }
   return new LiteRtLmBenchmarkInfo{std::move(*benchmark_info)};
+}
+
+LiteRtLmOptionalArgs* litert_lm_optional_args_create() {
+  return new LiteRtLmOptionalArgs{};
+}
+
+void litert_lm_optional_args_set_llg_constraint(
+    LiteRtLmOptionalArgs* optional_args, LlgConstraintType constraint_type,
+    const char* constraint_string) {
+  if (!optional_args || !constraint_string) {
+    return;
+  }
+  
+  litert::lm::LlgConstraintType cpp_type;
+  switch (constraint_type) {
+    case kLlgConstraintRegex:
+      cpp_type = litert::lm::LlgConstraintType::kRegex;
+      break;
+    case kLlgConstraintJsonSchema:
+      cpp_type = litert::lm::LlgConstraintType::kJsonSchema;
+      break;
+    case kLlgConstraintLark:
+      cpp_type = litert::lm::LlgConstraintType::kLark;
+      break;
+    case kLlgConstraintInternal:
+      cpp_type = litert::lm::LlgConstraintType::kLlGuidanceInternal;
+      break;
+    default:
+      ABSL_LOG(ERROR) << "Unknown constraint type: " << constraint_type;
+      return;
+  }
+  
+  optional_args->optional_args.decoding_constraint =
+      litert::lm::LlGuidanceConstraintArg{
+          .constraint_type = cpp_type,
+          .constraint_string = std::string(constraint_string),
+      };
+}
+
+void litert_lm_optional_args_set_max_output_tokens(
+    LiteRtLmOptionalArgs* optional_args, int max_output_tokens) {
+  if (!optional_args) {
+    return;
+  }
+  optional_args->optional_args.max_output_tokens = max_output_tokens;
+}
+
+void litert_lm_optional_args_delete(LiteRtLmOptionalArgs* optional_args) {
+  delete optional_args;
+}
+
+LiteRtLmJsonResponse* litert_lm_conversation_send_message_with_args(
+    LiteRtLmConversation* conversation, const char* message_json,
+    const LiteRtLmOptionalArgs* optional_args) {
+  if (!conversation || !conversation->conversation) {
+    return nullptr;
+  }
+  nlohmann::json json_message =
+      nlohmann::json::parse(message_json, /*cb=*/nullptr,
+                            /*allow_exceptions=*/false);
+  if (json_message.is_discarded()) {
+    ABSL_LOG(ERROR) << "Failed to parse message JSON.";
+    return nullptr;
+  }
+
+  absl::StatusOr<litert::lm::Message> response;
+  if (optional_args) {
+    // Create a mutable copy to move from
+    litert::lm::OptionalArgs cpp_optional_args;
+    cpp_optional_args.max_output_tokens = optional_args->optional_args.max_output_tokens;
+    cpp_optional_args.has_pending_message = optional_args->optional_args.has_pending_message;
+    cpp_optional_args.task_group_id = optional_args->optional_args.task_group_id;
+    cpp_optional_args.args = optional_args->optional_args.args;
+    cpp_optional_args.extra_context = optional_args->optional_args.extra_context;
+    // Manually reconstruct the constraint to avoid Android libc++ copy issues
+    // Note: ExternalConstraintArg is not copyable (contains unique_ptr) so we skip it
+    if (optional_args->optional_args.decoding_constraint) {
+      const auto& constraint = *optional_args->optional_args.decoding_constraint;
+      if (auto* llg_arg = std::get_if<litert::lm::LlGuidanceConstraintArg>(&constraint)) {
+        cpp_optional_args.decoding_constraint.emplace(
+          litert::lm::LlGuidanceConstraintArg{
+            .constraint_type = llg_arg->constraint_type,
+            .constraint_string = llg_arg->constraint_string,
+          });
+      } else if (auto* fst_arg = std::get_if<litert::lm::FstConstraintArg>(&constraint)) {
+        cpp_optional_args.decoding_constraint.emplace(
+          litert::lm::FstConstraintArg{
+            .constraint_string = fst_arg->constraint_string,
+          });
+      }
+      // ExternalConstraintArg contains unique_ptr and is not copyable, skip it
+    }
+    response = conversation->conversation->SendMessage(json_message, std::move(cpp_optional_args));
+  } else {
+    response = conversation->conversation->SendMessage(json_message);
+  }
+
+  if (!response.ok()) {
+    ABSL_LOG(ERROR) << "Failed to send message: " << response.status();
+    return nullptr;
+  }
+  auto* json_response = std::get_if<JsonMessage>(&*response);
+  if (!json_response) {
+    ABSL_LOG(ERROR) << "Response is not a JSON message.";
+    return nullptr;
+  }
+  auto* c_response = new LiteRtLmJsonResponse;
+  c_response->json_string = json_response->dump();
+  return c_response;
+}
+
+int litert_lm_conversation_send_message_stream_with_args(
+    LiteRtLmConversation* conversation, const char* message_json,
+    const LiteRtLmOptionalArgs* optional_args,
+    LiteRtLmStreamCallback callback, void* callback_data) {
+  if (!conversation || !conversation->conversation) {
+    return -1;
+  }
+  nlohmann::json json_message =
+      nlohmann::json::parse(message_json, /*cb=*/nullptr,
+                            /*allow_exceptions=*/false);
+  if (json_message.is_discarded()) {
+    ABSL_LOG(ERROR) << "Failed to parse message JSON.";
+    return -1;
+  }
+
+  absl::Status status;
+  if (optional_args) {
+    // Create a mutable copy to move from
+    litert::lm::OptionalArgs cpp_optional_args;
+    cpp_optional_args.max_output_tokens = optional_args->optional_args.max_output_tokens;
+    cpp_optional_args.has_pending_message = optional_args->optional_args.has_pending_message;
+    cpp_optional_args.task_group_id = optional_args->optional_args.task_group_id;
+    cpp_optional_args.args = optional_args->optional_args.args;
+    cpp_optional_args.extra_context = optional_args->optional_args.extra_context;
+    // Manually reconstruct the constraint to avoid Android libc++ copy issues
+    // Note: ExternalConstraintArg is not copyable (contains unique_ptr) so we skip it
+    if (optional_args->optional_args.decoding_constraint) {
+      const auto& constraint = *optional_args->optional_args.decoding_constraint;
+      if (auto* llg_arg = std::get_if<litert::lm::LlGuidanceConstraintArg>(&constraint)) {
+        cpp_optional_args.decoding_constraint.emplace(
+          litert::lm::LlGuidanceConstraintArg{
+            .constraint_type = llg_arg->constraint_type,
+            .constraint_string = llg_arg->constraint_string,
+          });
+      } else if (auto* fst_arg = std::get_if<litert::lm::FstConstraintArg>(&constraint)) {
+        cpp_optional_args.decoding_constraint.emplace(
+          litert::lm::FstConstraintArg{
+            .constraint_string = fst_arg->constraint_string,
+          });
+      }
+      // ExternalConstraintArg contains unique_ptr and is not copyable, skip it
+    }
+    status = conversation->conversation->SendMessageAsync(
+        json_message, CreateConversationCallback(callback, callback_data),
+        std::move(cpp_optional_args));
+  } else {
+    status = conversation->conversation->SendMessageAsync(
+        json_message, CreateConversationCallback(callback, callback_data));
+  }
+
+  if (!status.ok()) {
+    ABSL_LOG(ERROR) << "Failed to start message stream: " << status;
+    return static_cast<int>(status.code());
+  }
+  return 0;
 }
 
 }  // extern "C"
