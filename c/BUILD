@@ -85,6 +85,20 @@ cc_library(
     ],
 )
 
+# Shared library target for FFI consumers (Rust, Python, etc.).
+# Produces a self-contained .so with the full C API and all dependencies
+# statically linked in, following the same pattern as the JNI wrapper.
+cc_binary(
+    name = "liblitert_lm_c.so",
+    linkopts = ["-Wl,--version-script,$(location litert_lm_c.lds)"],
+    linkshared = 1,
+    visibility = ["//visibility:public"],
+    deps = [
+        ":engine",
+    ],
+    additional_linker_inputs = ["litert_lm_c.lds"],
+)
+
 cc_test(
     name = "engine_test",
     srcs = ["engine_test.cc"],

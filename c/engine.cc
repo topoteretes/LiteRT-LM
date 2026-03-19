@@ -258,12 +258,14 @@ LiteRtLmConversationConfig* litert_lm_conversation_config_create(
     }
   }
 
-  auto conversation_config =
-      litert::lm::ConversationConfig::Builder()
-          .SetSessionConfig(*config_to_use)
-          .SetPreface(json_preface)
-          .SetEnableConstrainedDecoding(enable_constrained_decoding)
-          .Build(*engine->engine);
+  auto builder = litert::lm::ConversationConfig::Builder()
+                     .SetSessionConfig(*config_to_use)
+                     .SetPreface(json_preface)
+                     .SetEnableConstrainedDecoding(enable_constrained_decoding);
+  if (enable_constrained_decoding) {
+    builder.SetConstraintProviderConfig(litert::lm::LlGuidanceConfig{});
+  }
+  auto conversation_config = builder.Build(*engine->engine);
 
   if (!conversation_config.ok()) {
     ABSL_LOG(ERROR) << "Failed to create conversation config: "

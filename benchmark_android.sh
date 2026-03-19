@@ -10,6 +10,9 @@ set -euo pipefail
 # Ensure output is not buffered
 exec 2>&1
 
+# Always run from the directory containing this script (required for bazel builds)
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
 export PATH="/home/dmytro/Android/Sdk/platform-tools:$PATH"
 export ANDROID_HOME="/home/dmytro/Android/Sdk"
 
@@ -43,40 +46,47 @@ find_qairt_file() {
 }
 
 DISPATCH_SO="${DISPATCH_SO:-$(find_first_file \
+  "$PWD/bazel-bin/external/litert/litert/vendors/qualcomm/dispatch/libdispatch_api.so" \
   "$PWD/bazel-bin/external/litert/litert/vendors/qualcomm/dispatch/libLiteRtDispatch_Qualcomm.so" \
+  "$PWD/bazel-out/arm64-v8a-opt/bin/external/litert/litert/vendors/qualcomm/dispatch/libdispatch_api.so" \
   "$PWD/bazel-out/arm64-v8a-opt/bin/external/litert/litert/vendors/qualcomm/dispatch/libLiteRtDispatch_Qualcomm.so" \
-  "$HOME/.cache/bazel/_bazel_dmytro/4aa95d11f0e0f122dfcdd727d11fcb01/execroot/litert_lm/bazel-out/arm64-v8a-opt/bin/external/litert/litert/vendors/qualcomm/dispatch/libLiteRtDispatch_Qualcomm.so")}"
+  "$HOME/.cache/bazel/_bazel_dmytro/12fe080a637873e23c66fd00ead1c6fe/execroot/litert_lm/bazel-out/arm64-v8a-opt/bin/external/litert/litert/vendors/qualcomm/dispatch/libdispatch_api.so" \
+  "$HOME/.cache/bazel/_bazel_dmytro/12fe080a637873e23c66fd00ead1c6fe/execroot/litert_lm/bazel-out/arm64-v8a-opt/bin/external/litert/litert/vendors/qualcomm/dispatch/libLiteRtDispatch_Qualcomm.so" \
+  "$HOME/.cache/bazel/_bazel_dmytro/4aa95d11f0e0f122dfcdd727d11fcb01/execroot/litert_lm/bazel-out/arm64-v8a-opt/bin/external/litert/litert/vendors/qualcomm/dispatch/libLiteRtDispatch_Qualcomm.so" || true)}"
 
-QNN_HTP_SO="${QNN_HTP_SO:-$(find_qairt_file 'aarch64-android/libQnnHtp.so')}"
-QNN_PREPARE_SO="${QNN_PREPARE_SO:-$(find_qairt_file 'aarch64-android/libQnnHtpPrepare.so')}"
-QNN_SYSTEM_SO="${QNN_SYSTEM_SO:-$(find_qairt_file 'aarch64-android/libQnnSystem.so')}"
-QNN_HTP_SKEL_SO="${QNN_HTP_SKEL_SO:-$(find_qairt_file 'hexagon-v75/unsigned/libQnnHtpV75Skel.so')}"
-QNN_HTP_STUB_SO="${QNN_HTP_STUB_SO:-$(find_qairt_file 'aarch64-android/libQnnHtpV75Stub.so')}"
+QNN_HTP_SO="${QNN_HTP_SO:-$(find_qairt_file 'aarch64-android/libQnnHtp.so' || true)}"
+QNN_PREPARE_SO="${QNN_PREPARE_SO:-$(find_qairt_file 'aarch64-android/libQnnHtpPrepare.so' || true)}"
+QNN_SYSTEM_SO="${QNN_SYSTEM_SO:-$(find_qairt_file 'aarch64-android/libQnnSystem.so' || true)}"
+QNN_HTP_SKEL_SO="${QNN_HTP_SKEL_SO:-$(find_qairt_file 'hexagon-v75/unsigned/libQnnHtpV75Skel.so' || true)}"
+QNN_HTP_STUB_SO="${QNN_HTP_STUB_SO:-$(find_qairt_file 'aarch64-android/libQnnHtpV75Stub.so' || true)}"
 
 # Function to build NPU dependencies if missing
 build_npu_dependencies() {
   echo ""
   echo "Building NPU runtime dependencies (this may take 3-5 minutes)..."
-  echo "Building litert_lm_main to generate Qualcomm dispatch + QNN libraries..."
-  
-  # Build main target which pulls in all NPU dependencies
-  bazel build --config=android_arm64 //runtime/engine:litert_lm_main \
-    --define=litert_link_capi_so=true \
-    --define=resolve_symbols_in_exec=false 2>&1 | tail -5
-  
+  echo "Building Qualcomm dispatch + QNN libraries..."
+
+  # Build the Qualcomm dispatch shared library explicitly
+  bazel build --config=android_arm64 \
+    @litert//litert/vendors/qualcomm/dispatch:dispatch_api 2>&1 | tail -5
+
   echo "Locating built libraries..."
-  
+
   # Re-find the libraries now that they should exist
   DISPATCH_SO=$(find_first_file \
+    "$PWD/bazel-bin/external/litert/litert/vendors/qualcomm/dispatch/libdispatch_api.so" \
     "$PWD/bazel-bin/external/litert/litert/vendors/qualcomm/dispatch/libLiteRtDispatch_Qualcomm.so" \
+    "$PWD/bazel-out/arm64-v8a-opt/bin/external/litert/litert/vendors/qualcomm/dispatch/libdispatch_api.so" \
     "$PWD/bazel-out/arm64-v8a-opt/bin/external/litert/litert/vendors/qualcomm/dispatch/libLiteRtDispatch_Qualcomm.so" \
-    "$HOME/.cache/bazel/_bazel_dmytro/4aa95d11f0e0f122dfcdd727d11fcb01/execroot/litert_lm/bazel-out/arm64-v8a-opt/bin/external/litert/litert/vendors/qualcomm/dispatch/libLiteRtDispatch_Qualcomm.so")
-  
-  QNN_HTP_SO=$(find_qairt_file 'aarch64-android/libQnnHtp.so')
-  QNN_PREPARE_SO=$(find_qairt_file 'aarch64-android/libQnnHtpPrepare.so')
-  QNN_SYSTEM_SO=$(find_qairt_file 'aarch64-android/libQnnSystem.so')
-  QNN_HTP_SKEL_SO=$(find_qairt_file 'hexagon-v75/unsigned/libQnnHtpV75Skel.so')
-  QNN_HTP_STUB_SO=$(find_qairt_file 'aarch64-android/libQnnHtpV75Stub.so')
+    "$HOME/.cache/bazel/_bazel_dmytro/12fe080a637873e23c66fd00ead1c6fe/execroot/litert_lm/bazel-out/arm64-v8a-opt/bin/external/litert/litert/vendors/qualcomm/dispatch/libdispatch_api.so" \
+    "$HOME/.cache/bazel/_bazel_dmytro/12fe080a637873e23c66fd00ead1c6fe/execroot/litert_lm/bazel-out/arm64-v8a-opt/bin/external/litert/litert/vendors/qualcomm/dispatch/libLiteRtDispatch_Qualcomm.so" \
+    "$HOME/.cache/bazel/_bazel_dmytro/4aa95d11f0e0f122dfcdd727d11fcb01/execroot/litert_lm/bazel-out/arm64-v8a-opt/bin/external/litert/litert/vendors/qualcomm/dispatch/libLiteRtDispatch_Qualcomm.so" || true)
+
+  QNN_HTP_SO=$(find_qairt_file 'aarch64-android/libQnnHtp.so' || true)
+  QNN_PREPARE_SO=$(find_qairt_file 'aarch64-android/libQnnHtpPrepare.so' || true)
+  QNN_SYSTEM_SO=$(find_qairt_file 'aarch64-android/libQnnSystem.so' || true)
+  QNN_HTP_SKEL_SO=$(find_qairt_file 'hexagon-v75/unsigned/libQnnHtpV75Skel.so' || true)
+  QNN_HTP_STUB_SO=$(find_qairt_file 'aarch64-android/libQnnHtpV75Stub.so' || true)
   
   # Verify all were found
   local all_found=true
@@ -279,7 +289,7 @@ run_benchmark() {
     --add_constraint=true \
     $npu_args $extra_args \
     --input_text_file=$text_file" \
-    > "$outfile" 2>&1
+    > "$outfile" 2>&1 || true
 
   local prefill=$(grep "Prefill Speed:" "$outfile" | head -1 | grep -oP '[\d.]+(?= tokens/sec)')
   local decode=$(grep "Decode Speed:" "$outfile" | head -1 | grep -oP '[\d.]+(?= tokens/sec)')
