@@ -27,20 +27,29 @@ one. Two things about this particular link matter:
    readelf -lW liblitert_lm_c.so | awk '/LOAD/{print $NF}'       # expect 0x4000
    ```
 
-To rebuild it:
+Both flags live in `//c:liblitert_lm_c.so`'s own `linkopts`, so rebuilding it is:
 
 ```bash
+LDSHIM=$(mktemp -d)
+ln -s "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/ld.lld" "$LDSHIM/"
 bazel build --config=android_arm64 \
-  --linkopt=-Wl,-z,max-page-size=16384 \
-  --host_linkopt=-Wl,-z,max-page-size=16384 \
+  --action_env="PATH=$LDSHIM:/usr/local/bin:/usr/bin:/bin" \
+  --host_action_env="PATH=$LDSHIM:/usr/local/bin:/usr/bin:/bin" \
   //c:liblitert_lm_c.so
 ```
 
-Bazel sanitises `PATH`, so the NDK's `ld.lld` is invisible to *host* actions and
-the build dies in `collect2: cannot find 'ld'`. `bfd` is not a workaround — it
-has no `--start-lib`. Expose lld through **both** `--action_env` and
-`--host_action_env`. The cognee-android repo's `scripts/build-litert.sh` does
-all of this, caches on the source revision, and re-checks both properties above.
+The shim is not optional. Bazel sanitises `PATH`, so the NDK's `ld.lld` is
+invisible to *host* actions and the build dies in `collect2: cannot find 'ld'`.
+Switching the host link to `bfd` is not a workaround — bfd has no `--start-lib`,
+which this graph uses. It has to go through **both** `--action_env` and
+`--host_action_env`; the link that fails is a host one, so setting only the
+first is the trap.
+
+The cognee-android repo's `scripts/build-litert.sh` does all of this, caches the
+result on the source revision, and re-checks both properties above. That build
+is bit-reproducible in practice: from this revision it produces sha256
+`b10671323604c99372be7153421e0bcf67e6ccca75c230c7361f0fcdffbdba42`, which is the
+file committed here.
 
 ## libLiteRtTopKWebGpuSampler.so
 
