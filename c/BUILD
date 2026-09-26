@@ -90,7 +90,27 @@ cc_library(
 # statically linked in, following the same pattern as the JNI wrapper.
 cc_binary(
     name = "liblitert_lm_c.so",
-    linkopts = ["-Wl,--version-script,$(location litert_lm_c.lds)"],
+    linkopts = [
+        "-Wl,--version-script,$(location litert_lm_c.lds)",
+        # 16 KB page size, which Android 16 requires of every native library
+        # an app loads. Without this the linker uses its 4 KB default and the
+        # LOAD segments come out at p_align 0x1000; a device running a 16 KB
+        # page kernel then refuses to map the library at all.
+        #
+        # This target is the ONLY one in the app that needs the flag stated
+        # here. Every other .so it ships — the accelerators, the samplers,
+        # the constraint provider, pdfium, libc++_shared, and the Rust
+        # cdylib — already comes out at 0x4000, because they are built by
+        # toolchains that default to it. This one is built here, by a Bazel
+        # config that does not.
+        #
+        # It cannot be fixed after the fact: this library's third LOAD
+        # segment sits at file offset 0xf27f70 against vaddr 0xf28f70, so
+        # offset and vaddr are congruent mod 0x1000 but not mod 0x4000.
+        # Raising p_align in the header alone would produce a file the
+        # loader maps to the wrong address. It has to be relinked.
+        "-Wl,-z,max-page-size=16384",
+    ],
     linkshared = 1,
     visibility = ["//visibility:public"],
     deps = [
