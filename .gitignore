@@ -2,3 +2,12 @@
 /bazel-*
 /build/
 /target/
+
+# Scratch artefacts left beside the vendored prebuilts.
+# tools/patch_sampler_so.py keeps the unpatched input as <name>.so.orig; the
+# unpatched blob is already in this repo's history, so the backup is noise.
+prebuilt/*/*.so.orig
+# benchmark_android.sh builds liblitert_lm_c_{sync,spec}.so from whatever
+# liblitert_lm_c.so is current, and .pre16k is the superseded 4 KB-page link.
+prebuilt/*/liblitert_lm_c_*.so
+prebuilt/*/*.so.pre16k
